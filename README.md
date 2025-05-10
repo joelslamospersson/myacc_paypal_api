@@ -30,6 +30,12 @@ gunicorn
 pip install -r requirements.txt
 ```
 
+### 5. Give correct permissions
+```
+sudo chmod 600 /var/www/html/paypal/.env
+sudo chown www-data:www-data /var/www/html/paypal/.env
+```
+
 ### Running the server ( Development )
 ```
 python app.py
