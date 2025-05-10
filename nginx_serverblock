@@ -1,0 +1,126 @@
+# Redirect all HTTP traffic to HTTPS
+server {
+    listen 80;
+    server_name yourdomain.com www.yourdomain.com;
+    return 301 https://$host$request_uri;
+}
+
+# Main HTTPS server
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl ipv6only=on;
+    server_name yourdomain.com www.yourdomain.com;
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+
+    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # ─── HTTPS SECURITY HEADERS ───────────────────────────
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # ─── RATE LIMITING ────────────────────────────────────
+    # Add this into http block
+	# /etc/nginx/nginx.conf
+	
+	# Rate limiting zone (5 requests/sec per IP)
+    #limit_req_zone $binary_remote_addr zone=basiclimit:10m rate=5r/s;
+
+	add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+	add_header Content-Security-Policy "upgrade-insecure-requests" always;
+
+
+    # Max upload size
+    client_max_body_size 10M;
+
+    # ─── SECURITY HARDENING ───────────────────────────────
+    location ~ /system {
+        deny all;
+    }
+
+    location ~ /\.(git|ht|md|json|dist)$ {
+        deny all;
+    }
+
+    location ~* (file://|\.%00) {
+        return 444;
+    }
+	
+	# Block .env files to be accessible to the web, important!
+	location ~* /\.env.* {
+		return 403;
+	}
+
+    # ─── PAYPAL INTEGRATION ───────────────────────────────
+    location /paypal-ipn {
+        limit_req zone=basiclimit burst=10;
+        access_log /var/log/nginx/paypal-ipn.log;
+        error_log /var/log/nginx/paypal-ipn_error.log;
+        proxy_pass http://127.0.0.1:5000/paypal-ipn;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /api/paypal/config {
+        proxy_pass http://127.0.0.1:5000/api/paypal/config;
+        proxy_set_header Host $host;
+    }
+
+    location /api/paypal/prices {
+        proxy_pass http://127.0.0.1:5000/api/paypal/prices;
+        proxy_set_header Host $host;
+    }
+
+    location /paypal-complete {
+        limit_req zone=basiclimit burst=5 nodelay;
+        proxy_pass http://127.0.0.1:5000/paypal-complete;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+	
+	# Make sure that paypal dir is not accessible, just in case
+	location ^~ /paypal {
+		deny all;
+		return 403;
+	}
+
+    # ─── PHP + SITE ROUTING ───────────────────────────────
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+        fastcgi_read_timeout 240;
+    }
+
+    access_log /var/log/nginx/yourdomain.access.log;
+    error_log /var/log/nginx/yourdomain.error.log;
+}
+
+# Redirect any unmatched IP/host to canonical domain
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 301 https://yourdomain.com$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    return 301 https://yourdomain.com$request_uri;
+}
