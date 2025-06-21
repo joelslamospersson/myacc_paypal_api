@@ -46,3 +46,5 @@ python app.py
 ```
 gunicorn --workers 3 --bind 127.0.0.1:5000 app:app
 ```
+
+# Webhooks and paypal setup
