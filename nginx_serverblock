@@ -84,7 +84,8 @@ server {
     }
 	
 	# Make sure that paypal dir is not accessible, just in case
-	location ^~ /paypal {
+	# Block /paypal/ (like /paypal/secrets), but NOT /paypal-ipn or /paypal-complete
+	location ~ ^/paypal/ {
 		deny all;
 		return 403;
 	}
