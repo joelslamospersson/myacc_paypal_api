@@ -4,7 +4,14 @@ import requests
 import os
 import re
 from datetime import datetime
-from config import DB_CONFIG, PAYPAL, PAYPAL_UI, FLASK_PORT, ORDER_LOG_DIR, AMOUNT_TO_POINTS
+from config import (
+    DB_CONFIG,
+    PAYPAL,        # for sandbox/live flags & IPN URLs
+    PAYPAL_UI,     # now holds both JS-SDK client_id and REST secret
+    FLASK_PORT,
+    ORDER_LOG_DIR,
+    AMOUNT_TO_POINTS
+)
 from hashlib import sha256
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -35,8 +42,8 @@ def verify_token():
 def get_paypal_config():
     return jsonify({
         'client_id': PAYPAL_UI['client_id'],
-        'currency': PAYPAL_UI['currency'],
-        'sandbox': PAYPAL_UI.get('sandbox', True)
+        'currency':  PAYPAL_UI['currency'],
+        'sandbox':   PAYPAL.get('sandbox', True)
     })
 
 @app.route('/api/paypal/prices')
@@ -46,20 +53,57 @@ def get_paypal_prices():
 @app.route('/paypal-complete', methods=['POST'])
 def paypal_complete():
     verify_token()
-    raw_data = request.data.decode(errors='ignore')
-    log_order(f"RAW REQUEST: {raw_data}\n")
+    raw = request.get_json(force=True)
+    log_order(f"RAW REQUEST: {raw}\n")
 
-    try:
-        data = request.get_json(force=True)
-        username = data.get('username')
-        payer_email = data.get('payer_email', 'unknown@paypal.com')
-        amount = float(data.get('amount') or 0)
-        points = AMOUNT_TO_POINTS.get(amount)
-    except Exception as e:
-        return jsonify({'error': f'Invalid input: {str(e)}'}), 400
+    order_id    = raw.get('orderID')
+    username    = raw.get('username')
+    payer_email = raw.get('payer_email', 'unknown@paypal.com')
 
-    if not username or not points:
-        return jsonify({'error': 'Missing username or amount'}), 400
+    if not order_id or not username:
+        return jsonify({'error': 'Missing orderID or username'}), 400
+
+    # Determine REST API base URL
+    base_url = 'https://api-m.sandbox.paypal.com' if PAYPAL.get('sandbox', True) \
+               else 'https://api-m.paypal.com'
+
+    # 1) Get an access token from PayPal
+    auth = (PAYPAL_UI['client_id'], PAYPAL_UI['secret'])
+    resp = requests.post(
+        f"{base_url}/v1/oauth2/token",
+        auth=auth,
+        headers={'Accept': 'application/json'},
+        data={'grant_type': 'client_credentials'}
+    )
+    if resp.status_code != 200:
+        log_order(f"PAYPAL AUTH ERROR: {resp.text}\n")
+        return jsonify({'error': 'PayPal authentication failed'}), 500
+    access_token = resp.json().get('access_token')
+
+    # 2) Retrieve the order details
+    order_resp = requests.get(
+        f"{base_url}/v2/checkout/orders/{order_id}",
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type':  'application/json'
+        }
+    )
+    if order_resp.status_code != 200:
+        log_order(f"PAYPAL ORDER FETCH ERROR: {order_resp.text}\n")
+        return jsonify({'error': 'Failed to fetch PayPal order'}), 400
+    order = order_resp.json()
+
+    # 3) Validate status and amount
+    if order.get('status') not in ('COMPLETED', 'CAPTURED'):
+        log_order(f"PAYPAL ORDER NOT COMPLETED: {order}\n")
+        return jsonify({'error': 'Order not completed'}), 400
+
+    pu = order.get('purchase_units', [])[0]
+    paid_value = float(pu['amount']['value'])
+    points = AMOUNT_TO_POINTS.get(paid_value)
+    if points is None:
+        log_order(f"UNEXPECTED AMOUNT {paid_value}: {order}\n")
+        return jsonify({'error': 'Invalid payment amount'}), 400
 
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -72,15 +116,20 @@ def paypal_complete():
 
         account_id = result[0]
 
-        cursor.execute("UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s", (points, account_id))
+        cursor.execute(
+            "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
+            (points, account_id)
+        )
         cursor.execute("""
-            INSERT INTO myaac_paypal (txn_id, email, account_id, price, currency, points, payer_status, payment_status, created)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO myaac_paypal (
+              txn_id, email, account_id, price, currency,
+              points, payer_status, payment_status, created
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            'web_checkout',
+            order_id,
             payer_email,
             account_id,
-            amount,
+            paid_value,
             PAYPAL_UI['currency'],
             points,
             'verified',
