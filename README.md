@@ -48,3 +48,15 @@ gunicorn --workers 3 --bind 127.0.0.1:5000 app:app
 ```
 
 # Webhooks and paypal setup
+```
+Use the default application already provided on your paypal account
+Take the client id and secret id, paste it into the config, swap out your email to the correct one,
+boot the script and sit back, relax
+
+# For Live and Sandbox
+This API does not use any webhooks anymore, so you do not have to edit the application, do the same for live/sandbox,
+Use your paypal email for live, use your sandbox buisiness account for sandbox and pay using a personal sandbox account
+
+You find both at the same spot, at developer paypal,
+Simply press the button up right corner between sandbox and live mode.
+```
