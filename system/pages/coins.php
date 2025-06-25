@@ -1,5 +1,5 @@
 <?php
-// Put this file at: /var/www/html/system/pages/coins.php
+
 defined('MYAAC') or die('Direct access not allowed!');
 $title = 'Buy Coins';
 
@@ -30,7 +30,7 @@ $token_hash = hash('sha256', getenv('PAYPAL_SHARED_SECRET'));
 <div id="paypal-button-container" style="min-height: 60px;"></div>
 
 <script>
-const token = <?= json_encode($token_hash) ?>;
+const token    = <?= json_encode($token_hash) ?>;
 const username = <?= json_encode($username) ?>;
 
 Promise.all([
@@ -38,50 +38,71 @@ Promise.all([
     fetch('/api/paypal/prices').then(res => res.json())
 ]).then(([config, prices]) => {
     const select = document.getElementById('point-package');
+
+    // Populate the dropdown
     Object.entries(prices).forEach(([price, points]) => {
-        const option = document.createElement('option');
-        option.value = price;
-        option.textContent = `${price} ${config.currency} - ${points} coins`;
-        select.appendChild(option);
+        const opt = document.createElement('option');
+        opt.value = price;
+        opt.textContent = `${price} ${config.currency} - ${points} coins`;
+        select.appendChild(opt);
     });
 
-    const script = document.createElement('script');
-    script.src = `https://www.paypal.com/sdk/js?client-id=${config.client_id}&currency=${config.currency}`;
-    script.onload = () => {
-        paypal.Buttons({
-            createOrder: function(data, actions) {
-                const amount = select.value;
-                return actions.order.create({
-                    purchase_units: [{ amount: { value: amount } }]
-                });
-            },
-            onApprove: function(data, actions) {
-                const amount = select.value;
-                return actions.order.capture().then(function(details) {
-                    const payer_email = details.payer.email_address || 'unknown@paypal.com';
-
-                    fetch('/paypal-complete', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-Auth-Token': token
-                        },
-                        body: JSON.stringify({ username, amount, payer_email })
-                    })
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.success) {
-                            alert('✅ Coins added to your account!');
-                            location.reload();
-                        } else {
-                            alert('❌ Error: ' + data.error);
-                        }
+    // Load PayPal SDK
+    const sdk = document.createElement('script');
+    sdk.src = `https://www.paypal.com/sdk/js?client-id=${config.client_id}&currency=${config.currency}`;
+    sdk.onload = () => {
+        // Function to render the button for the currently selected amount
+        function renderPayPalButton() {
+            paypal.Buttons({
+                createOrder: (data, actions) => {
+                    const amount = select.value;
+                    return actions.order.create({
+                        purchase_units: [{
+                            amount:    { value: amount },
+                            custom_id: username
+                        }]
                     });
-                });
-            }
-        }).render('#paypal-button-container');
+                },
+                onApprove: (data, actions) => {
+                    return actions.order.capture().then(details => {
+                        const payer_email = details.payer.email_address || 'unknown@paypal.com';
+                        return fetch('/paypal-complete', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Auth-Token': token
+                            },
+                            body: JSON.stringify({
+                                orderID:     data.orderID,
+                                username:    username,
+                                payer_email: payer_email
+                            })
+                        })
+                        .then(res => res.json())
+                        .then(json => {
+                            if (json.success) {
+                                alert('✅ Coins added to your account!');
+                                location.reload();
+                            } else {
+                                alert('❌ Error: ' + json.error);
+                            }
+                        });
+                    });
+                }
+            }).render('#paypal-button-container');
+        }
+
+        // Initial render
+        renderPayPalButton();
+
+        // Re-render whenever the user picks a different package
+        select.addEventListener('change', () => {
+            document.getElementById('paypal-button-container').innerHTML = '';
+            renderPayPalButton();
+        });
     };
-    document.head.appendChild(script);
+    document.head.appendChild(sdk);
+
 }).catch(err => {
     console.error('Error loading PayPal or prices:', err);
     document.getElementById('paypal-button-container').innerText = 'Failed to load PayPal.';
