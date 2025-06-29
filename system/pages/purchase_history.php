@@ -29,14 +29,15 @@ if ($totalStmt instanceof PDOStatement) {
 }
 $totalPages = (int) ceil($total / $perPage);
 
-// 2) fetch only this page
+// 2) fetch only this page ( now including payment_status )
 $sql = "
   SELECT
-    txn_id     AS order_id,
+    txn_id          AS order_id,
     DATE_FORMAT(created, '%Y-%m-%d %H:%i') AS purchased_at,
     price,
     currency,
-    points
+    points,
+    payment_status  AS status
   FROM myaac_paypal
   WHERE account_id = {$userId}
   ORDER BY created DESC
@@ -65,9 +66,10 @@ if ($stmt instanceof PDOStatement) {
   <table class="TableContent" cellpadding="4" cellspacing="1">
     <tr class="LabelH">
       <td style="width:150px;"><b>Date</b></td>
-      <td style="width:200px;"><b>Order ID</b></td>
+      <td style="width:180px;"><b>Order ID</b></td>
       <td style="width:100px;"><b>Amount</b></td>
       <td style="width:80px;"><b>Coins</b></td>
+      <td style="width:100px;"><b>Status</b></td>
     </tr>
 
     <?php if (count($orders) > 0): ?>
@@ -81,11 +83,12 @@ if ($stmt instanceof PDOStatement) {
             <?= htmlspecialchars($row['currency'],    ENT_QUOTES) ?>
           </td>
           <td><?= (int)$row['points'] ?></td>
+          <td><?= htmlspecialchars($row['status'], ENT_QUOTES) ?></td>
         </tr>
       <?php endforeach; ?>
     <?php else: ?>
       <tr class="Odd">
-        <td colspan="4" style="text-align:center;">
+        <td colspan="5" style="text-align:center;">
           You haven’t made any purchases yet.
         </td>
       </tr>
