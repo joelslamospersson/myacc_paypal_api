@@ -1,4 +1,6 @@
-# Redirect all HTTP traffic to HTTPS
+# Requires to add rate limit, or remove rate limit from block!
+
+# Redirect HTTP → HTTPS
 server {
     listen 80;
     server_name yourdomain.com www.yourdomain.com;
@@ -11,117 +13,129 @@ server {
     listen [::]:443 ssl ipv6only=on;
     server_name yourdomain.com www.yourdomain.com;
 
-    root /var/www/html;
+    root /var/www/yourdomain;
     index index.php index.html index.htm;
 
-    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
 
-    # ─── HTTPS SECURITY HEADERS ───────────────────────────
+    # ─── TRUST CLOUDFLARE’S CF-Connecting-IP ───────────────────
+    # (Copy these IPv4/IPv6 ranges from https://developers.cloudflare.com/ips/)
+    set_real_ip_from   103.21.244.0/22;
+    set_real_ip_from   103.22.200.0/22;
+    set_real_ip_from   103.31.4.0/22;
+    set_real_ip_from   104.16.0.0/13;
+    set_real_ip_from   104.24.0.0/14;
+    set_real_ip_from   108.162.192.0/18;
+    set_real_ip_from   131.0.72.0/22;
+    set_real_ip_from   141.101.64.0/18;
+    set_real_ip_from   162.158.0.0/15;
+    set_real_ip_from   172.64.0.0/13;
+    set_real_ip_from   173.245.48.0/20;
+    set_real_ip_from   188.114.96.0/20;
+    set_real_ip_from   190.93.240.0/20;
+    set_real_ip_from   197.234.240.0/22;
+    set_real_ip_from   198.41.128.0/17;
+
+    set_real_ip_from   2400:cb00::/32;
+    set_real_ip_from   2606:4700::/32;
+    set_real_ip_from   2803:f800::/32;
+    set_real_ip_from   2405:b500::/32;
+    set_real_ip_from   2405:8100::/32;
+    set_real_ip_from   2a06:98c0::/29;
+    set_real_ip_from   2c0f:f248::/32;
+
+    real_ip_header     CF-Connecting-IP;
+    real_ip_recursive  on;
+
+    # ─── SECURITY HEADERS ─────────────────────────────────
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header Content-Security-Policy       "upgrade-insecure-requests"             always;
 
-    # ─── RATE LIMITING ────────────────────────────────────
-    # Add this into http block
-	# /etc/nginx/nginx.conf
-	
-	# Rate limiting zone (5 requests/sec per IP)
-    #limit_req_zone $binary_remote_addr zone=basiclimit:10m rate=5r/s;
-
-	add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-	add_header Content-Security-Policy "upgrade-insecure-requests" always;
-
-
-    # Max upload size
     client_max_body_size 10M;
 
-    # ─── SECURITY HARDENING ───────────────────────────────
-    location ~ /system {
-        deny all;
+    # ─── BLOCK SENSITIVE FILES ─────────────────────────────
+    location ~ /system          { deny all; }
+    location ~ /\.(git|ht|md|json|dist)$ { deny all; }
+    location ~* (file://|\.%00) { return 444; }
+    location ~* /\.env.*        { return 403; }
+
+    # ─── PAYPAL DIR PROTECTION ─────────────────────────────
+    location ~ ^/paypal/ {
+        deny all; return 403;
     }
 
-    location ~ /\.(git|ht|md|json|dist)$ {
-        deny all;
+    # ─── PROXY ALL /api/* TO FLASK ──────────────────────────
+    location ^~ /api/ {
+        # rate-limit, restrict methods as desired
+        proxy_pass         http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection        "";
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 30s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
     }
 
-    location ~* (file://|\.%00) {
-        return 444;
-    }
-	
-	# Block .env files to be accessible to the web, important!
-	location ~* /\.env.* {
-		return 403;
-	}
-
-    # ─── PAYPAL INTEGRATION ───────────────────────────────
+    # ─── PAYPAL IPN & COMPLETE ────────────────────────────
     location /paypal-ipn {
-        limit_req zone=basiclimit burst=10;
-        access_log /var/log/nginx/paypal-ipn.log;
-        error_log /var/log/nginx/paypal-ipn_error.log;
-        proxy_pass http://127.0.0.1:5000/paypal-ipn;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-
-    location /api/paypal/config {
-        proxy_pass http://127.0.0.1:5000/api/paypal/config;
-        proxy_set_header Host $host;
-    }
-
-    location /api/paypal/prices {
-        proxy_pass http://127.0.0.1:5000/api/paypal/prices;
-        proxy_set_header Host $host;
+        proxy_pass         http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection        "";
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 30s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
     }
 
     location /paypal-complete {
-        limit_req zone=basiclimit burst=5 nodelay;
-        proxy_pass http://127.0.0.1:5000/paypal-complete;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        limit_req zone=apilimit burst=5 nodelay;
+        limit_except POST { deny all; }
+
+        proxy_pass         http://127.0.0.1:5000/paypal-complete;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 30s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
     }
-	
-	# Make sure that paypal dir is not accessible, just in case
-	# Block /paypal/ (like /paypal/secrets), but NOT /paypal-ipn or /paypal-complete
-	location ~ ^/paypal/ {
-		deny all;
-		return 403;
-	}
 
     # ─── PHP + SITE ROUTING ───────────────────────────────
     location / {
         try_files $uri $uri/ /index.php?$args;
     }
-
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
-        fastcgi_read_timeout 240;
+        fastcgi_pass   unix:/var/run/php/php8.3-fpm.sock;
+        fastcgi_read_timeout 240s;
     }
 
-    access_log /var/log/nginx/yourdomain.access.log;
-    error_log /var/log/nginx/yourdomain.error.log;
+    access_log /var/log/nginx/yourdomain.com.access.log;
+    error_log  /var/log/nginx/yourdomain.com.error.log;
 }
 
-# Redirect any unmatched IP/host to canonical domain
+# Redirect unmatched hosts to canonical domain
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80 default_server;       listen [::]:80 default_server;
     server_name _;
     return 301 https://yourdomain.com$request_uri;
 }
-
 server {
-    listen 443 ssl default_server;
-    listen [::]:443 ssl default_server;
+    listen 443 ssl default_server;  listen [::]:443 ssl default_server;
     server_name _;
-
-    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
     return 301 https://yourdomain.com$request_uri;
 }
