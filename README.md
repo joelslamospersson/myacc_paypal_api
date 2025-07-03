@@ -37,6 +37,20 @@ sudo chown www-data:www-data /var/www/html/paypal/.env
 sudo chmod 775 /var/www/html/paypal/.env
 ```
 
+### 6. Add rate limiting, required for server block
+```
+# /etc/nginx/nginx.conf
+http {
+    # … your other http settings …
+
+    # ─── RATE LIMITING ZONE ─────────────────────────────────
+    # 5 requests per second per IP, 10 MB of state
+    limit_req_zone $binary_remote_addr zone=apilimit:10m rate=5r/s;
+
+    # include your sites-available/*.conf etc.
+}
+```
+
 ### Running the server ( Development )
 ```
 python app.py
