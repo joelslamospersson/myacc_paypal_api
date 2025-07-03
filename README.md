@@ -1,6 +1,25 @@
 # myacc_paypal_api
 Paypal API written with Python for MyAcc ( Live + Sandbox )
 
+Latest Update:
+```
+• Click-through agreement modal – users now accept TOS once, timestamped & displayed on the page
+• Package picker redesigned as icon buttons for faster selection
+• PayPal buttons auto-render on load & selection—no manual swaps
+
+Security Improvements:
+• Verify custom_id → prevents order spoofing
+• Enforce unique PayPal transactions (idempotent processing)
+• Validate currency on every order
+• Stronger X-Auth-Token (SHA-256 hashed secret)
+• Short-lived PayPal OAuth tokens per request
+
+Fixes & Tweaks:
+• Debug logging of all order requests & responses
+• Proper capture-amount lookup for v2 orders
+• Safe DB schema migrations at startup (agreement log & unique txn index)
+```
+
 ## 🔧 Setup Instructions
 
 ### 1. Install Dependencies
