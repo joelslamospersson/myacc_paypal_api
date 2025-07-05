@@ -62,6 +62,10 @@ sudo chmod 775 /var/www/html/paypal/.env
 http {
     # … your other http settings …
 
+    # Paypal api
+    client_header_buffer_size 8k;
+    large_client_header_buffers 4 16k;
+    proxy_read_timeout 60;
     # ─── RATE LIMITING ZONE ─────────────────────────────────
     # 5 requests per second per IP, 10 MB of state
     limit_req_zone $binary_remote_addr zone=apilimit:10m rate=5r/s;
