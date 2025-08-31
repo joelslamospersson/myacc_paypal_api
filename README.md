@@ -58,7 +58,7 @@ sudo chmod 775 /var/www/html/paypal/.env
 
 ### 6. Add rate limiting, required for server block
 ```
-# /etc/nginx/nginx.conf
+# sudo nano /etc/nginx/nginx.conf #nginx.conf path at default position
 http {
     # … your other http settings …
 
