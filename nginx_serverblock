@@ -69,7 +69,10 @@ server {
 
     # ─── PROXY ALL /api/* TO FLASK ──────────────────────────
     location ^~ /api/ {
-        # rate-limit, restrict methods as desired
+        # rate-limit, restrict methods as desired ( This is default )
+        limit_req zone=apilimit burst=5 nodelay;
+        limit_except POST { deny all; }
+
         proxy_pass         http://127.0.0.1:5000;
         proxy_http_version 1.1;
         proxy_set_header   Connection        "";
@@ -84,6 +87,10 @@ server {
 
     # ─── PAYPAL IPN & COMPLETE ────────────────────────────
     location /paypal-ipn {
+        # rate-limit, restrict methods as desired ( This is default )
+        limit_req zone=apilimit burst=10 nodelay;
+        limit_except POST { deny all; }
+
         proxy_pass         http://127.0.0.1:5000;
         proxy_http_version 1.1;
         proxy_set_header   Connection        "";
@@ -97,6 +104,7 @@ server {
     }
 
     location /paypal-complete {
+        # rate-limit, restrict methods as desired ( This is default )
         limit_req zone=apilimit burst=5 nodelay;
         limit_except POST { deny all; }
 
