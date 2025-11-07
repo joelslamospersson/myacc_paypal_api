@@ -19,7 +19,8 @@ from config import (
     AMOUNT_TO_POINTS,
     COIN_IMAGES,
     SECRET_KEY,
-    PAYPAL_SHARED_SECRET as SHARED_SECRET
+    PAYPAL_SHARED_SECRET as SHARED_SECRET,
+    Currency
 )
 
 app = Flask(__name__)
@@ -110,7 +111,7 @@ def ensure_all_tables():
                 INDEX (created)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
-            
+                
             conn.commit()
             print("[DDL] Tables created/verified successfully")
             
@@ -165,11 +166,11 @@ def log_agreement():
     if token != expected:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
-    # 2) Extract username
+    # 2) Extract and validate username ( Updated for security means )
     data = request.get_json(force=True)
-    username = data.get('username')
-    if not username:
-        return jsonify({'success': False, 'error': 'Missing username'}), 400
+    username = data.get('username', '').strip()
+    if not username or not re.match(r'^[A-Za-z0-9_-]+$', username):
+        return jsonify({'success': False, 'error': 'Invalid username'}), 400
 
     # 3) Gather metadata — use ProxyFix so remote_addr is the real client IP
     ip_address  = request.remote_addr or 'unknown'
@@ -181,7 +182,7 @@ def log_agreement():
     query_executor = None
     try:
         conn   = mysql.connector.connect(**DB_CONFIG)
-        query_executor = conn.query_executor()
+        query_executor = conn.cursor()
         query_executor.execute("SELECT id FROM accounts WHERE name = %s", (username,))
         row = query_executor.fetchone()
         if not row:
@@ -244,12 +245,14 @@ def paypal_complete():
     raw = request.get_json(force=True)
     log_order(f"RAW REQUEST: {raw}\n")
 
-    order_id     = raw.get('orderID')
-    username     = raw.get('username')
-    payer_email  = raw.get('payer_email', 'unknown@paypal.com')
+    order_id     = raw.get('orderID', '').strip()
+    username     = raw.get('username', '').strip()
+    payer_email  = raw.get('payer_email', 'unknown@paypal.com').strip()
     agreement_id = raw.get('agreement_id')
     if not (order_id and username and agreement_id):
         return jsonify({'error': 'Missing orderID, username, or agreement_id'}), 400
+    if not re.match(r'^[A-Za-z0-9_-]+$', username):
+        return jsonify({'error': 'Invalid username format'}), 400
 
     # 3) fetch PayPal order
     base = 'https://api-m.sandbox.paypal.com' if PAYPAL.get('sandbox',True) else 'https://api-m.paypal.com'
@@ -304,7 +307,7 @@ def paypal_complete():
         conn   = mysql.connector.connect(**DB_CONFIG)
         # Set transaction isolation before starting transaction
         conn.autocommit = False
-        query_executor = conn.query_executor()
+        query_executor = conn.cursor()
         query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         conn.start_transaction()
 
@@ -335,13 +338,24 @@ def paypal_complete():
             'verified','Completed', datetime.utcnow()
         ))
         
-        # 9) Update coins only after successful INSERT
-        query_executor.execute(
-            "UPDATE accounts SET coins_transferable=coins_transferable+%s WHERE id=%s",
-            (points, account_id)
-        )
+        # 9) Add currency to account based on config.py Currency setting
+        if Currency.lower() == "points":
+            # Add premium points
+            query_executor.execute(
+                "UPDATE accounts SET premium_points = premium_points + %s WHERE id = %s",
+                (points, account_id)
+            )
+            currency_name = "points"
+        else:
+            # Add coins_transferable (default to coins if not "points")
+            query_executor.execute(
+                "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
+                (points, account_id)
+            )
+            currency_name = "coins"
+        
         conn.commit()
-        return jsonify({'success':True, 'points':points}), 200
+        return jsonify({'success':True, 'points':points, 'currency': currency_name, 'message':f'{points} {currency_name} added to account.'}), 200
 
     except mysql.connector.IntegrityError as e:
         # Duplicate key error (1062) - transaction already processed (fallback)
@@ -386,7 +400,7 @@ def paypal_ipn():
     payment_status = ipn_data.get('payment_status')
     payer_status = ipn_data.get('payer_status', '')
     receiver_email = ipn_data.get('receiver_email')
-    custom_username = ipn_data.get('custom')
+    custom_username = ipn_data.get('custom', '').strip()
     try:
         mc_gross = float(ipn_data.get('mc_gross', '0.00'))
     except ValueError:
@@ -396,6 +410,9 @@ def paypal_ipn():
     if not txn_id or not is_valid_email(receiver_email) or not custom_username:
         log_order(log_data + "ERROR: Missing fields.\n")
         return "Invalid data", 400
+    if not re.match(r'^[A-Za-z0-9_-]+$', custom_username):
+        log_order(log_data + f"ERROR: Invalid username format: {custom_username}\n")
+        return "Invalid username format", 400
 
     if payment_status != "Completed" or receiver_email != PAYPAL['receiver_email']:
         log_order(log_data + "ERROR: Unauthorized or incomplete.\n")
@@ -410,7 +427,7 @@ def paypal_ipn():
         conn = mysql.connector.connect(**DB_CONFIG)
         # Set transaction isolation before starting transaction
         conn.autocommit = False
-        query_executor = conn.query_executor()
+        query_executor = conn.cursor()
         query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         conn.start_transaction()
 
@@ -439,10 +456,24 @@ def paypal_ipn():
             txn_id, receiver_email, account_id, mc_gross, currency, points, payer_status, payment_status, datetime.utcnow()
         ))
         
-        # Update coins only after successful INSERT
-        query_executor.execute("UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s", (points, account_id))
+        # Add currency to account based on config.py Currency setting
+        if Currency.lower() == "points":
+            # Add premium points
+            query_executor.execute(
+                "UPDATE accounts SET premium_points = premium_points + %s WHERE id = %s",
+                (points, account_id)
+            )
+            currency_name = "points"
+        else:
+            # Add coins_transferable (default to coins if not "points")
+            query_executor.execute(
+                "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
+                (points, account_id)
+            )
+            currency_name = "coins"
+        
         conn.commit()
-        log_order(log_data + f"SUCCESS: {points} points added to '{custom_username}'.\n")
+        log_order(log_data + f"SUCCESS: {points} {currency_name} added to '{custom_username}'.\n")
         return "OK", 200
 
     except mysql.connector.IntegrityError as e:
