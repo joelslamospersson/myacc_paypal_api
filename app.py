@@ -3,6 +3,9 @@ import mysql.connector
 import requests
 import os
 import re
+import traceback
+import fcntl
+import time
 from datetime import datetime
 from hashlib import sha256
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -49,50 +52,100 @@ def verify_token():
     if token != expected:
         abort(403)
 
-# Auto generate database table for agreement if not exist
-def ensure_agreement_table():
-    """Create coin_purchase_agreement_log if it doesn’t already exist."""
+# Ensure all database tables exist ( with file locking to prevent multiple workers )
+def ensure_all_tables():
+    """Create all required tables if they don't exist. Uses file locking to ensure only one worker creates tables."""
+    lock_file_path = os.path.join(ORDER_LOG_DIR, '.table_creation.lock')
+    lock_file = None
+    
     try:
-        conn   = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS coin_purchase_agreement_log (
-            id             INT AUTO_INCREMENT PRIMARY KEY,
-            user_id        INT          NOT NULL,
-            accepted_at    DATETIME     NOT NULL,
-            ip_address     VARCHAR(45)  NOT NULL,
-            user_agent     VARCHAR(255) NOT NULL,
-            order_id       VARCHAR(255) NULL,
-            payer_email    VARCHAR(255) NULL,
-            INDEX (user_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """)
-        conn.commit()
-    except Exception as e:
-        print(f"[DDL ERROR] {e}")
-    finally:
-        cursor.close()
-        conn.close()
+        # Create lock file if it doesn't exist
+        os.makedirs(ORDER_LOG_DIR, exist_ok=True)
+        lock_file = open(lock_file_path, 'w')
         
-# Ensure unique index on txn_id in myaac_paypal
-def ensure_paypal_index():
-    try:
-        conn   = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        # add unique index if missing
-        cursor.execute("""
-        ALTER TABLE myaac_paypal
-          ADD UNIQUE KEY uq_txn_id (txn_id)
-        """
-        )
-        conn.commit()
-    except mysql.connector.Error as err:
-        # error code 1061 = duplicate key name, ignore
-        if err.errno != 1061:
-            print(f"[DDL ERROR] {err}")
+        # Try to acquire exclusive lock (non-blocking)
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            # Another worker is creating tables, wait a bit and check if tables exist
+            time.sleep(0.5)
+            return
+        
+        # We have the lock - create tables
+        conn = None
+        query_executor = None
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            query_executor = conn.cursor()
+            
+            # Create coin_purchase_agreement_log table
+            query_executor.execute("""
+            CREATE TABLE IF NOT EXISTS coin_purchase_agreement_log (
+                id             INT AUTO_INCREMENT PRIMARY KEY,
+                user_id        INT          NOT NULL,
+                accepted_at    DATETIME     NOT NULL,
+                ip_address     VARCHAR(45)  NOT NULL,
+                user_agent     VARCHAR(255) NOT NULL,
+                order_id       VARCHAR(255) NULL,
+                payer_email    VARCHAR(255) NULL,
+                INDEX (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+            
+            # Create myaac_paypal table if not exists
+            query_executor.execute("""
+            CREATE TABLE IF NOT EXISTS myaac_paypal (
+                id             INT AUTO_INCREMENT PRIMARY KEY,
+                txn_id         VARCHAR(255) NOT NULL,
+                email          VARCHAR(255) NOT NULL,
+                account_id     INT          NOT NULL,
+                price          DECIMAL(10,2) NOT NULL,
+                currency       VARCHAR(10)  NOT NULL,
+                points         INT         NOT NULL,
+                payer_status   VARCHAR(50)  DEFAULT 'verified',
+                payment_status VARCHAR(50)  DEFAULT 'Completed',
+                created        DATETIME     NOT NULL,
+                UNIQUE KEY uq_txn_id (txn_id),
+                INDEX (account_id),
+                INDEX (created)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+            
+            conn.commit()
+            print("[DDL] Tables created/verified successfully")
+            
+        except mysql.connector.Error as err:
+            # Error 1050 = table already exists ( from CREATE TABLE IF NOT EXISTS )
+            # Error 1061 = duplicate key name ( from UNIQUE KEY )
+            if err.errno not in (1050, 1061):
+                print(f"[DDL ERROR] {err}")
+        except Exception as e:
+            print(f"[DDL ERROR] {e}")
+        finally:
+            try:
+                if query_executor:
+                    query_executor.close()
+            except:
+                pass
+            try:
+                if conn and conn.is_connected():
+                    conn.close()
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"[DDL LOCK ERROR] {e}")
     finally:
-        cursor.close()
-        conn.close()
+        if lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+            except:
+                pass
+
+# Ensure database tables exist on app startup ( runs with gunicorn too ) / New
+# Only one worker will actually create tables due to file locking
+ensure_all_tables()
 
 @app.route('/api/paypal/config')
 def get_paypal_config():
@@ -124,22 +177,24 @@ def log_agreement():
     accepted_at = datetime.utcnow()
 
     # 4) Log to DB
+    conn = None
+    query_executor = None
     try:
         conn   = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM accounts WHERE name = %s", (username,))
-        row = cursor.fetchone()
+        query_executor = conn.query_executor()
+        query_executor.execute("SELECT id FROM accounts WHERE name = %s", (username,))
+        row = query_executor.fetchone()
         if not row:
             return jsonify({'success': False, 'error': 'User not found'}), 404
 
         account_id = row[0]
-        cursor.execute("""
+        query_executor.execute("""
           INSERT INTO coin_purchase_agreement_log
             (user_id, accepted_at, ip_address, user_agent)
           VALUES (%s, %s, %s, %s)
         """, (account_id, accepted_at, ip_address, user_agent))
         conn.commit()
-        agreement_id = cursor.lastrowid
+        agreement_id = query_executor.lastrowid
 
         # Now returns date:time:hour
         return jsonify({
@@ -148,12 +203,27 @@ def log_agreement():
             'accepted_at':  accepted_at.replace(microsecond=0).isoformat()  # e.g. "2025-07-03T19:12:45"
         })
 
-    except Exception:
+    except Exception as e:
+        try:
+            if conn:
+                conn.rollback()
+        except:
+            pass
+        # Log the actual error for debugging
+        log_order(f"AGREEMENT ERROR: {str(e)}\n{traceback.format_exc()}\n")
         return jsonify({'success': False, 'error': 'Database error'}), 500
 
     finally:
-        cursor.close()
-        conn.close()
+        try:
+            if query_executor:
+                query_executor.close()
+        except:
+            pass
+        try:
+            if conn and conn.is_connected():
+                conn.close()
+        except:
+            pass
 
 @app.route('/api/paypal/prices')
 def get_paypal_prices():
@@ -229,28 +299,33 @@ def paypal_complete():
         log_order(f"BAD AMOUNT {paid_value}: {order}\n")
         return jsonify({'error':'Invalid amount'}), 400
 
-    # 5) open DB and do idempotent check
+    # 5) open DB and process transaction atomically with row-level locking
     try:
         conn   = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
+        # Set transaction isolation before starting transaction
+        conn.autocommit = False
+        query_executor = conn.query_executor()
+        query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        conn.start_transaction()
 
-        cursor.execute("SELECT COUNT(*) FROM myaac_paypal WHERE txn_id=%s", (txn_id,))
-        if cursor.fetchone()[0] > 0:
-            # already done
-            return jsonify({'success': True, 'message':'Already processed'}), 200
-
-        # 6) credit user
-        cursor.execute("SELECT id FROM accounts WHERE name=%s", (username,))
-        row = cursor.fetchone()
+        # 6) Get account ID first
+        query_executor.execute("SELECT id FROM accounts WHERE name=%s", (username,))
+        row = query_executor.fetchone()
         if not row:
+            conn.rollback()
             return jsonify({'error':'User not found'}), 404
         account_id = row[0]
 
-        cursor.execute(
-            "UPDATE accounts SET coins_transferable=coins_transferable+%s WHERE id=%s",
-            (points, account_id)
-        )
-        cursor.execute("""
+        # 7) Check if transaction already exists (with lock to prevent race condition)
+        query_executor.execute("SELECT id FROM myaac_paypal WHERE txn_id=%s FOR UPDATE", (txn_id,))
+        existing = query_executor.fetchone()
+        if existing:
+            conn.rollback()
+            log_order(f"DUPLICATE TXN: {txn_id} - Already processed\n")
+            return jsonify({'success': True, 'message':'Already processed'}), 200
+
+        # 8) Insert transaction record first (atomic operation)
+        query_executor.execute("""
             INSERT INTO myaac_paypal
               (txn_id,email,account_id,price,currency,points,payer_status,payment_status,created)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -259,17 +334,38 @@ def paypal_complete():
             PAYPAL_UI['currency'], points,
             'verified','Completed', datetime.utcnow()
         ))
+        
+        # 9) Update coins only after successful INSERT
+        query_executor.execute(
+            "UPDATE accounts SET coins_transferable=coins_transferable+%s WHERE id=%s",
+            (points, account_id)
+        )
         conn.commit()
-
         return jsonify({'success':True, 'points':points}), 200
+
+    except mysql.connector.IntegrityError as e:
+        # Duplicate key error (1062) - transaction already processed (fallback)
+        try:
+            conn.rollback()
+        except:
+            pass
+        log_order(f"DUPLICATE TXN: {txn_id} - Already processed (IntegrityError)\n")
+        return jsonify({'success': True, 'message':'Already processed'}), 200
 
     except Exception as e:
         log_order(f"DB ERROR: {e}\n")
+        try:
+            conn.rollback()
+        except:
+            pass
         return jsonify({'error':str(e)}), 500
 
     finally:
-        try: cursor.close(); conn.close()
-        except: pass
+        try: 
+            query_executor.close()
+            conn.close()
+        except: 
+            pass
 
 @app.route('/paypal-ipn', methods=['POST'])
 def paypal_ipn():
@@ -312,42 +408,69 @@ def paypal_ipn():
 
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
+        # Set transaction isolation before starting transaction
+        conn.autocommit = False
+        query_executor = conn.query_executor()
+        query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        conn.start_transaction()
 
-        cursor.execute("SELECT id FROM accounts WHERE name = %s", (custom_username,))
-        result = cursor.fetchone()
+        query_executor.execute("SELECT id FROM accounts WHERE name = %s", (custom_username,))
+        result = query_executor.fetchone()
         if not result:
+            conn.rollback()
             log_order(log_data + f"ERROR: User '{custom_username}' not found.\n")
             return "User not found", 404
 
         account_id = result[0]
 
-        cursor.execute("UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s", (points, account_id))
-        cursor.execute("""
+        # Check if transaction already exists (with lock to prevent race condition)
+        query_executor.execute("SELECT id FROM myaac_paypal WHERE txn_id=%s FOR UPDATE", (txn_id,))
+        existing = query_executor.fetchone()
+        if existing:
+            conn.rollback()
+            log_order(log_data + f"DUPLICATE TXN: {txn_id} - Already processed\n")
+            return "OK", 200
+
+        # Insert transaction record first (atomic operation)
+        query_executor.execute("""
             INSERT INTO myaac_paypal (txn_id, email, account_id, price, currency, points, payer_status, payment_status, created)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             txn_id, receiver_email, account_id, mc_gross, currency, points, payer_status, payment_status, datetime.utcnow()
         ))
-
+        
+        # Update coins only after successful INSERT
+        query_executor.execute("UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s", (points, account_id))
         conn.commit()
         log_order(log_data + f"SUCCESS: {points} points added to '{custom_username}'.\n")
         return "OK", 200
 
+    except mysql.connector.IntegrityError as e:
+        # Duplicate key error (1062) - transaction already processed (fallback)
+        try:
+            conn.rollback()
+        except:
+            pass
+        log_order(log_data + f"DUPLICATE TXN: {txn_id} - Already processed (IntegrityError)\n")
+        return "OK", 200
+
     except Exception as e:
         log_order(log_data + f"ERROR: {e}\n")
+        try:
+            conn.rollback()
+        except:
+            pass
         return "Server error", 500
 
     finally:
         try:
             if conn.is_connected():
-                cursor.close()
+                query_executor.close()
                 conn.close()
         except:
             pass
 
 if __name__ == '__main__':
     # ensure the table is created before we start
-    ensure_agreement_table()
-    ensure_paypal_index()
+    ensure_all_tables()
     app.run(host='127.0.0.1', port=FLASK_PORT)
