@@ -78,3 +78,8 @@ ORDER_LOG_DIR = 'order_logs'
 
 # IPN listener endpoint (used for documentation, not dynamic)
 PAYPAL_IPN_URL = 'https://yourdomain.com/paypal-ipn'
+
+# Currency type: "points" or "coins"
+# This determines what gets added to the player's account automatically
+# Set to "points" to add premium_points, or "coins" to add coins_transferable
+Currency = "points"  # Change to "coins" to add coins_transferable instead
