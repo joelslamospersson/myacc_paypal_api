@@ -18,6 +18,12 @@ Fixes & Tweaks:
 • Debug logging of all order requests & responses
 • Proper capture-amount lookup for v2 orders
 • Safe DB schema migrations at startup (agreement log & unique txn index)
+
+# 2025-11-07
+-Added option to select points or coins as coins_transferable
+-Fixed an issue where error 500 occured on new setups with agreement
+-Added an option to add a route on new myacc version to simply use coins and history at the menu
+-changed the way workers handles the orders to make sure it only handles once instead of accidental multiple ( Has not occured yet but to make sure )
 ```
 
 ## 🔧 Setup Instructions
