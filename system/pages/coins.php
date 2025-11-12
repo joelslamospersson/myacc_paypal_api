@@ -1,502 +1,337 @@
-from flask import Flask, request, jsonify, abort, session
-import mysql.connector
-import requests
-import os
-import re
-import traceback
-import fcntl
-import time
-from datetime import datetime
-from hashlib import sha256
-from werkzeug.middleware.proxy_fix import ProxyFix
+<?php
+defined('MYAAC') or die('Direct access not allowed!');
+$title = 'Buy Coins';
 
-from config import (
-    DB_CONFIG,
-    PAYPAL,        # sandbox/live flags & IPN URLs
-    PAYPAL_UI,     # JS-SDK client_id & REST secret
-    FLASK_PORT,
-    ORDER_LOG_DIR,
-    AMOUNT_TO_POINTS,
-    COIN_IMAGES,
-    SECRET_KEY,
-    PAYPAL_SHARED_SECRET as SHARED_SECRET,
-    Currency
-)
+if (! $logged || ! isset($account_logged)) {
+    header('Location: /index.php');
+    exit;
+}
 
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
+$username = $account_logged->getName();
 
-# production-safe cookies
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,    # JS can’t read the cookie
-    SESSION_COOKIE_SECURE=True,      # only send over HTTPS
-    SESSION_COOKIE_SAMESITE='Lax',   # or 'Strict' if you prefer
-)
+// Load .env secrets
+$envFile = __DIR__ . '/../../paypal/.env';
+if (file_exists($envFile)) {
+    foreach (file($envFile) as $line) {
+        if (strpos($line, '=') !== false) {
+            putenv(trim($line));
+        }
+    }
+}
+$token_hash = hash('sha256', getenv('PAYPAL_SHARED_SECRET'));
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title><?= htmlspecialchars($title) ?></title>
+  <link rel="stylesheet" href="/css/bootstrap.min.css">
+  <style>
+    /* Agreement badge */
+    #agreement-status {
+      position: absolute;
+      top: 20px; right: 20px;
+      padding: 6px 14px;
+      font-size: .95em;
+      color: #fff;
+      background: #c03;
+      border-radius: 4px;
+      z-index: 1;
+    }
+    #agreement-status.accepted { background: #3a6; }
 
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
-os.makedirs(ORDER_LOG_DIR, exist_ok=True)
+    /* Package buttons */
+    #packages {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      justify-content: center;
+      margin-bottom: 24px;
+    }
+    .package-btn {
+      width: 140px;
+      text-align: center;
+      border: 2px solid #7f5a2a;
+      background: #fdf9f3;
+      border-radius: 8px;
+      padding: 12px 8px;
+      cursor: pointer;
+      transition: background .2s, border-color .2s;
+      font-family: Tahoma, sans-serif;
+    }
+    .package-btn.selected {
+      background: #7f5a2a;
+      border-color: #503d20;
+      color: #fff;
+    }
+    .package-btn img {
+      max-width: 80px;
+      display: block;
+      margin: 0 auto 8px;
+    }
 
-def log_order(content):
-    try:
-        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        with open(f'{ORDER_LOG_DIR}/order_{ts}.log', 'w') as f:
-            f.write(content)
-    except Exception as e:
-        print(f"[log_order ERROR] {e}")
+    /* PayPal container */
+    #paypal-button-container {
+      min-height: 60px;
+      opacity: 0.5;
+      pointer-events: none;
+    }
 
-def is_valid_email(email):
-    return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email) is not None
+    /* Overlay */
+    .terms-overlay {
+      position: fixed; top:0; left:0;
+      width:100vw; height:100vh;
+      background: rgba(0,0,0,0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+    }
+    .terms-box {
+      background: #fdf9f3;
+      border:1px solid #b08b57;
+      border-radius:8px;
+      width:90%; max-width:800px;
+      max-height:85vh; overflow-y:auto;
+      box-shadow:0 4px 20px rgba(0,0,0,0.3);
+      font-family: Tahoma, sans-serif;
+      color:#333;
+    }
+    .terms-header {
+      background:#7f5a2a; color:#fff;
+      padding:12px 20px;
+      font-size:1.4em;
+      border-top-left-radius:6px;
+      border-top-right-radius:6px;
+    }
+    .terms-content {
+      padding:20px; line-height:1.5em; font-size:0.95em;
+    }
+    .terms-content h3 {
+      margin-top:1.2em; color:#7f5a2a;
+      border-bottom:1px solid #b08b57; padding-bottom:4px;
+    }
+    .terms-footer {
+      padding:12px 20px; text-align:right;
+      border-top:1px solid #e0d6c8;
+    }
+    .terms-btn {
+      background:#7f5a2a; color:#fff; border:none;
+      padding:8px 18px; font-size:1em;
+      border-radius:4px; cursor:pointer;
+    }
+    .terms-btn:disabled { opacity:0.6; cursor:not-allowed; }
+  </style>
+</head>
+<body>
+  <div class="container my-5" style="position:relative;">
+    <h1><?= htmlspecialchars($title) ?></h1>
+    <div id="agreement-status">Agreement: Not accepted</div>
 
-def verify_token():
-    token   = request.headers.get('X-Auth-Token', '')
-    expected= sha256(SHARED_SECRET.encode()).hexdigest()
-    if token != expected:
-        abort(403)
+    <p>Select a package and pay with PayPal:</p>
+    <div id="packages"></div>
+    <div id="paypal-button-container"></div>
+  </div>
 
-# Ensure all database tables exist ( with file locking to prevent multiple workers )
-def ensure_all_tables():
-    """Create all required tables if they don't exist. Uses file locking to ensure only one worker creates tables."""
-    lock_file_path = os.path.join(ORDER_LOG_DIR, '.table_creation.lock')
-    lock_file = None
-    
-    try:
-        # Create lock file if it doesn't exist
-        os.makedirs(ORDER_LOG_DIR, exist_ok=True)
-        lock_file = open(lock_file_path, 'w')
-        
-        # Try to acquire exclusive lock (non-blocking)
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except IOError:
-            # Another worker is creating tables, wait a bit and check if tables exist
-            time.sleep(0.5)
-            return
-        
-        # We have the lock - create tables
-        conn = None
-        query_executor = None
-        try:
-            conn = mysql.connector.connect(**DB_CONFIG)
-            query_executor = conn.cursor()
-            
-            # Create coin_purchase_agreement_log table
-            query_executor.execute("""
-            CREATE TABLE IF NOT EXISTS coin_purchase_agreement_log (
-                id             INT AUTO_INCREMENT PRIMARY KEY,
-                user_id        INT          NOT NULL,
-                accepted_at    DATETIME     NOT NULL,
-                ip_address     VARCHAR(45)  NOT NULL,
-                user_agent     VARCHAR(255) NOT NULL,
-                order_id       VARCHAR(255) NULL,
-                payer_email    VARCHAR(255) NULL,
-                INDEX (user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-            
-            # Create myaac_paypal table if not exists
-            query_executor.execute("""
-            CREATE TABLE IF NOT EXISTS myaac_paypal (
-                id             INT AUTO_INCREMENT PRIMARY KEY,
-                txn_id         VARCHAR(255) NOT NULL,
-                email          VARCHAR(255) NOT NULL,
-                account_id     INT          NOT NULL,
-                price          DECIMAL(10,2) NOT NULL,
-                currency       VARCHAR(10)  NOT NULL,
-                points         INT         NOT NULL,
-                payer_status   VARCHAR(50)  DEFAULT 'verified',
-                payment_status VARCHAR(50)  DEFAULT 'Completed',
-                created        DATETIME     NOT NULL,
-                UNIQUE KEY uq_txn_id (txn_id),
-                INDEX (account_id),
-                INDEX (created)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-                
-            conn.commit()
-            print("[DDL] Tables created/verified successfully")
-            
-        except mysql.connector.Error as err:
-            # Error 1050 = table already exists ( from CREATE TABLE IF NOT EXISTS )
-            # Error 1061 = duplicate key name ( from UNIQUE KEY )
-            if err.errno not in (1050, 1061):
-                print(f"[DDL ERROR] {err}")
-        except Exception as e:
-            print(f"[DDL ERROR] {e}")
-        finally:
-            try:
-                if query_executor:
-                    query_executor.close()
-            except:
-                pass
-            try:
-                if conn and conn.is_connected():
-                    conn.close()
-            except:
-                pass
-                
-    except Exception as e:
-        print(f"[DDL LOCK ERROR] {e}")
-    finally:
-        if lock_file:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                lock_file.close()
-            except:
-                pass
+  <script>
+  (function(){
+    const token    = <?= json_encode($token_hash) ?>;
+    const username = <?= json_encode($username) ?>;
 
-# Ensure database tables exist on app startup ( runs with gunicorn too ) / New
-# Only one worker will actually create tables due to file locking
-ensure_all_tables()
+    // Load stored consent
+    let agreementId   = localStorage.getItem('coinsAgreementId');
+    let agreementTime = localStorage.getItem('coinsAgreementTime');
 
-@app.route('/api/paypal/config')
-def get_paypal_config():
-    return jsonify({
-        'client_id': PAYPAL_UI['client_id'],
-        'currency':  PAYPAL_UI['currency'],
-        'sandbox':   PAYPAL.get('sandbox', True),
-        'images':    COIN_IMAGES
-    })
+    let paypalCfg, pricesGlobal;
+    let selectedPrice, paypalRendered = false;
 
-# Agreement endpoint
-@app.route('/api/agreement', methods=['POST'])
-def log_agreement():
-    # 1) Verify token header
-    token    = request.headers.get('X-Auth-Token')
-    expected = sha256(SHARED_SECRET.encode()).hexdigest()
-    if token != expected:
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+    // Update badge with date/time
+    function markAgreed(){
+      const badge = document.getElementById('agreement-status');
+      const ts = agreementTime
+        ? new Date(agreementTime).toLocaleString()
+        : '';
+      badge.textContent = `Agreement: Accepted ${ts}`;
+      badge.classList.add('accepted');
+      document.getElementById('paypal-button-container')
+              .style.cssText = 'opacity:1;pointer-events:auto;';
+    }
 
-    # 2) Extract username
-    data = request.get_json(force=True)
-    username = data.get('username')
-    if not username:
-        return jsonify({'success': False, 'error': 'Missing username'}), 400
+    // Build package buttons
+    function initPackages(prices, images){
+      pricesGlobal = prices;
+      const container = document.getElementById('packages');
+      container.innerHTML = '';
+      Object.entries(prices).forEach(([price, pts])=>{
+        const btn = document.createElement('div');
+        btn.className = 'package-btn';
+        btn.dataset.price = price;
+        btn.innerHTML = `
+          <img src="${images[price]||'/images/coins_default.png'}" alt="">
+          <div>${price} ${paypalCfg.currency}</div>
+          <small>${pts} coins</small>`;
+        btn.addEventListener('click', ()=>{
+          if (!agreementId) return;
+          container.querySelectorAll('.package-btn')
+                   .forEach(b=>b.classList.remove('selected'));
+          btn.classList.add('selected');
+          selectedPrice  = price;
+          paypalRendered = false;
+          document.getElementById('paypal-button-container').innerHTML = '';
+          renderPayPalButton();
+        });
+        container.appendChild(btn);
+      });
+    }
 
-    # 3) Gather metadata — use ProxyFix so remote_addr is the real client IP
-    ip_address  = request.remote_addr or 'unknown'
-    user_agent  = request.headers.get('User-Agent', 'unknown')
-    accepted_at = datetime.utcnow()
+    // Render PayPal button
+    function renderPayPalButton(){
+	  if (!selectedPrice || paypalRendered) return;
+	  paypalRendered = true;
 
-    # 4) Log to DB
-    conn = None
-    query_executor = None
-    try:
-        conn   = mysql.connector.connect(**DB_CONFIG)
-        query_executor = conn.cursor()
-        query_executor.execute("SELECT id FROM accounts WHERE name = %s", (username,))
-        row = query_executor.fetchone()
-        if not row:
-            return jsonify({'success': False, 'error': 'User not found'}), 404
+	  paypal.Buttons({
+		// 1) createOrder MUST return the purchase_units array
+		createOrder: (data, actions) => {
+		  return actions.order.create({
+			purchase_units: [{
+			  amount: {
+				// ensure it’s a string or number with two decimals
+				value: selectedPrice
+			  },
+			  custom_id: username
+			}]
+		  });
+		},
 
-        account_id = row[0]
-        query_executor.execute("""
-          INSERT INTO coin_purchase_agreement_log
-            (user_id, accepted_at, ip_address, user_agent)
-          VALUES (%s, %s, %s, %s)
-        """, (account_id, accepted_at, ip_address, user_agent))
-        conn.commit()
-        agreement_id = query_executor.lastrowid
+		// 2) onApprove should capture once, using the details passed in
+		onApprove: (data, actions) => {
+		  return actions.order.capture().then(details => {
+			const payer_email = details.payer.email_address || 'unknown@paypal.com';
 
-        # Now returns date:time:hour
-        return jsonify({
-            'success':      True,
-            'agreement_id': agreement_id,
-            'accepted_at':  accepted_at.replace(microsecond=0).isoformat()  # e.g. "2025-07-03T19:12:45"
-        })
+			return fetch('/paypal-complete', {
+			  method: 'POST',
+			  headers: {
+				'Content-Type': 'application/json',
+				'X-Auth-Token': token
+			  },
+			  body: JSON.stringify({
+				orderID:      data.orderID,
+				username:     username,
+				payer_email:  payer_email,
+				agreement_id: agreementId
+			  })
+			})
+			.then(r => r.json())
+			.then(js => {
+			  if (js.success) {
+				alert(`✅ Purchase complete! ${js.points || ''} points added.`);
+				location.reload();
+			  } else {
+				alert(`❌ Error: ${js.error}`);
+			  }
+			});
+		  });
+		}
 
-    except Exception as e:
-        try:
-            if conn:
-                conn.rollback()
-        except:
-            pass
-        # Log the actual error for debugging
-        log_order(f"AGREEMENT ERROR: {str(e)}\n{traceback.format_exc()}\n")
-        return jsonify({'success': False, 'error': 'Database error'}), 500
+	  }).render('#paypal-button-container');
+	}
 
-    finally:
-        try:
-            if query_executor:
-                query_executor.close()
-        except:
-            pass
-        try:
-            if conn and conn.is_connected():
-                conn.close()
-        except:
-            pass
+    // Show agreement overlay
+    function showTermsOverlay(){
+      const ov = document.createElement('div'); ov.className='terms-overlay';
+      const bx = document.createElement('div'); bx.className='terms-box';
+      bx.innerHTML = `
+        <div class="terms-header">Virtual Legal Binding Agreement</div>
+        <div class="terms-content">
+          <p><strong>Product:</strong> MMO-RPG Virtual Coins (OTServer).</p>
+          <h3>1. Offer & Acceptance</h3>
+          <p>Seller offers to sell virtual coins; Buyer accepts by clicking “I Agree”.</p>
+          <h3>2. Consideration</h3>
+          <p>Payment via PayPal is valid consideration in exchange for in-game coins.</p>
+          <h3>3. Intent</h3>
+          <p>Both parties intend this clickwrap to be legally binding.</p>
+          <h3>4. Legality & Capacity</h3>
+          <p>Agreement is lawful. Buyer represents age ≥18 and capacity to contract.</p>
+          <h3>5. Delivery & Refunds</h3>
+          <ul>
+            <li>Coins delivered instantly upon payment capture.</li>
+            <li>All sales final. No refunds or chargebacks once transaction completes.</li>
+          </ul>
+          <h3>6. Governing Law</h3>
+          <p>Governing law: [Your Jurisdiction]. Disputes in its courts.</p>
+          <p><em>This electronic agreement is as binding as a handwritten contract.</em></p>
+        </div>
+        <div class="terms-footer">
+          <button class="terms-btn" id="agree-btn">I Agree</button>
+        </div>`;
+      ov.appendChild(bx);
+      document.body.appendChild(ov);
 
-@app.route('/api/paypal/prices')
-def get_paypal_prices():
-    return jsonify(AMOUNT_TO_POINTS)
+      bx.querySelector('#agree-btn').addEventListener('click', async e=>{
+        const btn = e.target;
+        btn.disabled = true;
+        btn.textContent = 'Recording…';
+        try {
+          const res = await fetch('/api/agreement', {
+            method:'POST',
+            headers:{
+              'Content-Type':'application/json',
+              'X-Auth-Token': token
+            },
+            body: JSON.stringify({ username })
+          });
+          if (!res.ok) throw new Error('Status '+res.status);
+          const js = await res.json();
+          if (!js.success) throw new Error(js.error||'');
+          agreementId   = js.agreement_id;
+          agreementTime = js.accepted_at;
+          localStorage.setItem('coinsAgreementId', agreementId);
+          localStorage.setItem('coinsAgreementTime', agreementTime);
 
-@app.route('/paypal-complete', methods=['POST'])
-def paypal_complete():
-    # 1) debug dump
-    try:
-        with open(f'{ORDER_LOG_DIR}/debug_{datetime.utcnow():%Y%m%d_%H%M%S}.log', 'w') as f:
-            f.write("Headers:\n" + repr(request.headers) + "\n")
-            f.write("Body:\n" + request.get_data(as_text=True))
-    except:
-        pass
+          document.body.removeChild(ov);
+          markAgreed();
+          initPackages(pricesGlobal, paypalCfg.images);
+        } catch(err) {
+          console.error(err);
+          alert('Error recording agreement:\n'+err.message);
+          btn.disabled = false;
+          btn.textContent = 'I Agree';
+        }
+      });
+    }
 
-    # 2) auth & parse
-    verify_token()
-    raw = request.get_json(force=True)
-    log_order(f"RAW REQUEST: {raw}\n")
+    // Load config & prices
+    Promise.all([
+      fetch('/api/paypal/config').then(r=>r.json()),
+      fetch('/api/paypal/prices').then(r=>r.json())
+    ]).then(([cfg, prices])=>{
+      paypalCfg    = cfg;
+      pricesGlobal = prices;
 
-    order_id     = raw.get('orderID')
-    username     = raw.get('username')
-    payer_email  = raw.get('payer_email', 'unknown@paypal.com')
-    agreement_id = raw.get('agreement_id')
-    if not (order_id and username and agreement_id):
-        return jsonify({'error': 'Missing orderID, username, or agreement_id'}), 400
+      initPackages(prices, cfg.images);
+      if (agreementId) markAgreed();
 
-    # 3) fetch PayPal order
-    base = 'https://api-m.sandbox.paypal.com' if PAYPAL.get('sandbox',True) else 'https://api-m.paypal.com'
-    auth = (PAYPAL_UI['client_id'], PAYPAL_UI['secret'])
-    tkn = requests.post(f"{base}/v1/oauth2/token", auth=auth, data={'grant_type':'client_credentials'})
-    if tkn.status_code!=200:
-        log_order(f"AUTH ERROR: {tkn.text}\n")
-        return jsonify({'error':'PayPal auth failed'}), 500
-    access_token = tkn.json()['access_token']
+      // load PayPal SDK
+      const sdk = document.createElement('script');
+      sdk.src = `https://www.paypal.com/sdk/js?client-id=${cfg.client_id}&currency=${cfg.currency}`;
+      sdk.onload = ()=> {
+        if (agreementId) {
+          // auto-select first package to render
+          const first = document.querySelector('#packages .package-btn');
+          if (first) first.click();
+        }
+      };
+      document.head.appendChild(sdk);
+    }).catch(err=>{
+      console.error('Load error',err);
+      document.getElementById('paypal-button-container')
+              .innerText = 'Failed to load payment options.';
+    });
 
-    ord_res = requests.get(
-        f"{base}/v2/checkout/orders/{order_id}",
-        headers={'Authorization':f'Bearer {access_token}'}
-    )
-    if ord_res.status_code!=200:
-        log_order(f"ORDER FETCH ERROR: {ord_res.text}\n")
-        return jsonify({'error':'Failed to fetch order'}), 400
-    order = ord_res.json()
-
-    # 4) basic PayPal sanity checks
-    if order.get('status') not in ('COMPLETED','CAPTURED'):
-        log_order(f"ORDER NOT COMPLETED: {order}\n")
-        return jsonify({'error':'Order not completed'}), 400
-
-    pu = order['purchase_units'][0]
-
-    # 4a) custom_id → user binding
-    if pu.get('custom_id') != username:
-        log_order(f"USER MISMATCH: expected {username}, got {pu.get('custom_id')}\n")
-        return jsonify({'error':'User mismatch'}), 403
-
-    # 4b) currency enforcement
-    if pu['amount']['currency_code'] != PAYPAL_UI['currency']:
-        log_order(f"BAD CURRENCY: {pu['amount']}\n")
-        return jsonify({'error':'Invalid currency'}), 400
-
-    # 4c) drill into capture
-    caps = pu.get('payments',{}).get('captures',[])
-    if not caps or caps[0].get('status')!='COMPLETED':
-        log_order(f"CAPTURE MISSING/FAILED: {order}\n")
-        return jsonify({'error':'Capture not completed'}), 400
-
-    txn_id     = caps[0]['id']
-    paid_value = float(caps[0]['amount']['value'])
-    points     = AMOUNT_TO_POINTS.get(paid_value)
-    if points is None:
-        log_order(f"BAD AMOUNT {paid_value}: {order}\n")
-        return jsonify({'error':'Invalid amount'}), 400
-
-    # 5) open DB and process transaction atomically with row-level locking
-    try:
-        conn   = mysql.connector.connect(**DB_CONFIG)
-        # Set transaction isolation before starting transaction
-        conn.autocommit = False
-        query_executor = conn.cursor()
-        query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        conn.start_transaction()
-
-        # 6) Get account ID first
-        query_executor.execute("SELECT id FROM accounts WHERE name=%s", (username,))
-        row = query_executor.fetchone()
-        if not row:
-            conn.rollback()
-            return jsonify({'error':'User not found'}), 404
-        account_id = row[0]
-
-        # 7) Check if transaction already exists (with lock to prevent race condition)
-        query_executor.execute("SELECT id FROM myaac_paypal WHERE txn_id=%s FOR UPDATE", (txn_id,))
-        existing = query_executor.fetchone()
-        if existing:
-            conn.rollback()
-            log_order(f"DUPLICATE TXN: {txn_id} - Already processed\n")
-            return jsonify({'success': True, 'message':'Already processed'}), 200
-
-        # 8) Insert transaction record first (atomic operation)
-        query_executor.execute("""
-            INSERT INTO myaac_paypal
-              (txn_id,email,account_id,price,currency,points,payer_status,payment_status,created)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            txn_id, payer_email, account_id, paid_value,
-            PAYPAL_UI['currency'], points,
-            'verified','Completed', datetime.utcnow()
-        ))
-        
-        # 9) Add currency to account based on config.py Currency setting
-        if Currency.lower() == "points":
-            # Add premium points
-            query_executor.execute(
-                "UPDATE accounts SET premium_points = premium_points + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "points"
-        else:
-            # Add coins_transferable (default to coins if not "points")
-            query_executor.execute(
-                "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "coins"
-        
-        conn.commit()
-        return jsonify({'success':True, 'points':points, 'currency': currency_name, 'message':f'{points} {currency_name} added to account.'}), 200
-
-    except mysql.connector.IntegrityError as e:
-        # Duplicate key error (1062) - transaction already processed (fallback)
-        try:
-            conn.rollback()
-        except:
-            pass
-        log_order(f"DUPLICATE TXN: {txn_id} - Already processed (IntegrityError)\n")
-        return jsonify({'success': True, 'message':'Already processed'}), 200
-
-    except Exception as e:
-        log_order(f"DB ERROR: {e}\n")
-        try:
-            conn.rollback()
-        except:
-            pass
-        return jsonify({'error':str(e)}), 500
-
-    finally:
-        try: 
-            query_executor.close()
-            conn.close()
-        except: 
-            pass
-
-@app.route('/paypal-ipn', methods=['POST'])
-def paypal_ipn():
-    ipn_data = request.form.to_dict()
-    verify_payload = {'cmd': '_notify-validate'}
-    verify_payload.update(ipn_data)
-
-    paypal_url = PAYPAL['sandbox_url'] if PAYPAL['sandbox'] else PAYPAL['live_url']
-    verify_response = requests.post(paypal_url, data=verify_payload)
-
-    log_data = f"IPN RECEIVED:\n{ipn_data}\nVerification: {verify_response.text}\n"
-
-    if verify_response.text != 'VERIFIED':
-        log_order(log_data + "ERROR: IPN not verified.\n")
-        return "Invalid IPN", 400
-
-    txn_id = ipn_data.get('txn_id')
-    payment_status = ipn_data.get('payment_status')
-    payer_status = ipn_data.get('payer_status', '')
-    receiver_email = ipn_data.get('receiver_email')
-    custom_username = ipn_data.get('custom')
-    try:
-        mc_gross = float(ipn_data.get('mc_gross', '0.00'))
-    except ValueError:
-        return "Invalid amount", 400
-    currency = ipn_data.get('mc_currency', PAYPAL_UI['currency'])
-
-    if not txn_id or not is_valid_email(receiver_email) or not custom_username:
-        log_order(log_data + "ERROR: Missing fields.\n")
-        return "Invalid data", 400
-
-    if payment_status != "Completed" or receiver_email != PAYPAL['receiver_email']:
-        log_order(log_data + "ERROR: Unauthorized or incomplete.\n")
-        return "Unauthorized", 403
-
-    points = next((v for k, v in AMOUNT_TO_POINTS.items() if abs(k - mc_gross) < 0.01), None)
-    if not points:
-        log_order(log_data + f"ERROR: Unknown amount: {mc_gross}\n")
-        return "Unknown amount", 400
-
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        # Set transaction isolation before starting transaction
-        conn.autocommit = False
-        query_executor = conn.cursor()
-        query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        conn.start_transaction()
-
-        query_executor.execute("SELECT id FROM accounts WHERE name = %s", (custom_username,))
-        result = query_executor.fetchone()
-        if not result:
-            conn.rollback()
-            log_order(log_data + f"ERROR: User '{custom_username}' not found.\n")
-            return "User not found", 404
-
-        account_id = result[0]
-
-        # Check if transaction already exists (with lock to prevent race condition)
-        query_executor.execute("SELECT id FROM myaac_paypal WHERE txn_id=%s FOR UPDATE", (txn_id,))
-        existing = query_executor.fetchone()
-        if existing:
-            conn.rollback()
-            log_order(log_data + f"DUPLICATE TXN: {txn_id} - Already processed\n")
-            return "OK", 200
-
-        # Insert transaction record first (atomic operation)
-        query_executor.execute("""
-            INSERT INTO myaac_paypal (txn_id, email, account_id, price, currency, points, payer_status, payment_status, created)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            txn_id, receiver_email, account_id, mc_gross, currency, points, payer_status, payment_status, datetime.utcnow()
-        ))
-        
-        # Add currency to account based on config.py Currency setting
-        if Currency.lower() == "points":
-            # Add premium points
-            query_executor.execute(
-                "UPDATE accounts SET premium_points = premium_points + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "points"
-        else:
-            # Add coins_transferable (default to coins if not "points")
-            query_executor.execute(
-                "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "coins"
-        
-        conn.commit()
-        log_order(log_data + f"SUCCESS: {points} {currency_name} added to '{custom_username}'.\n")
-        return "OK", 200
-
-    except mysql.connector.IntegrityError as e:
-        # Duplicate key error (1062) - transaction already processed (fallback)
-        try:
-            conn.rollback()
-        except:
-            pass
-        log_order(log_data + f"DUPLICATE TXN: {txn_id} - Already processed (IntegrityError)\n")
-        return "OK", 200
-
-    except Exception as e:
-        log_order(log_data + f"ERROR: {e}\n")
-        try:
-            conn.rollback()
-        except:
-            pass
-        return "Server error", 500
-
-    finally:
-        try:
-            if conn.is_connected():
-                query_executor.close()
-                conn.close()
-        except:
-            pass
-
-if __name__ == '__main__':
-    # ensure the table is created before we start
-    ensure_all_tables()
-    app.run(host='127.0.0.1', port=FLASK_PORT)
+    window.addEventListener('DOMContentLoaded', ()=>{
+      if (!agreementId) showTermsOverlay();
+    });
+  })();
+  </script>
+</body>
+</html>
