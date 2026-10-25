@@ -188,6 +188,27 @@ def verified_payee(purchase_unit, capture):
     return False
 
 
+def validate_order_before_capture(order, account_id, expected_price, expected_currency):
+    """Verify beneficiary, owner and amount *before* moving the buyer's funds."""
+    units = order.get("purchase_units") or []
+    if len(units) != 1:
+        raise ValueError("Unexpected PayPal purchase units")
+    unit = units[0]
+    if unit.get("custom_id") != str(account_id):
+        raise ValueError("PayPal account binding mismatch")
+    amount = unit.get("amount") or {}
+    try:
+        total = Decimal(str(amount["value"])).quantize(Decimal("0.01"))
+    except (KeyError, InvalidOperation, TypeError):
+        raise ValueError("Invalid PayPal order amount")
+    if total != expected_price or amount.get("currency_code") != expected_currency:
+        raise ValueError("PayPal order amount/currency mismatch")
+    if not verified_payee(unit, {}):
+        raise ValueError("PayPal recipient not validated")
+    if order.get("status") not in ("CREATED", "APPROVED", "COMPLETED"):
+        raise ValueError("PayPal order not eligible for capture")
+
+
 def validate_capture(order, account_id, expected_price, expected_currency):
     if order.get("status") != "COMPLETED":
         raise ValueError("PayPal order is not completed")
@@ -346,6 +367,7 @@ def capture_order():
         token = paypal_token()
         order = paypal_request("GET", "/v2/checkout/orders/" + order_id, token)
         if order.get("status") != "COMPLETED":
+            validate_order_before_capture(order, account_id, expected_amount, expected_currency)
             order = paypal_request(
                 "POST", "/v2/checkout/orders/" + order_id + "/capture", token,
                 data={},
