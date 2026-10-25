@@ -1,507 +1,433 @@
-from flask import Flask, request, jsonify, abort, session
-import mysql.connector
-import requests
+"""PayPal Orders v2 checkout backend for MyAAC.
+
+The browser never receives a privileged API credential. MyAAC's authenticated PHP
+page calls /internal/* over loopback and signs each request with an HMAC. Only
+server-created orders belonging to the authenticated account can grant credit.
+"""
+import hmac
+import logging
 import os
 import re
-import traceback
-import fcntl
-import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+
+import mysql.connector
+import requests
+from flask import Flask, abort, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import (
-    DB_CONFIG,
-    PAYPAL,        # sandbox/live flags & IPN URLs
-    PAYPAL_UI,     # JS-SDK client_id & REST secret
-    FLASK_PORT,
-    ORDER_LOG_DIR,
-    AMOUNT_TO_POINTS,
-    COIN_IMAGES,
-    SECRET_KEY,
-    PAYPAL_SHARED_SECRET as SHARED_SECRET,
-    Currency
+    DB_CONFIG, PAYPAL, PAYPAL_UI, FLASK_PORT, AMOUNT_TO_POINTS,
+    COIN_IMAGES, SECRET_KEY, PAYPAL_INTERNAL_SECRET, Currency,
 )
 
+log = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-
-# production-safe cookies
 app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,    # JS can’t read the cookie
-    SESSION_COOKIE_SECURE=True,      # only send over HTTPS
-    SESSION_COOKIE_SAMESITE='Lax',   # or 'Strict' if you prefer
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=16384,
 )
+# Flask is behind exactly one trusted localhost reverse proxy.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
-os.makedirs(ORDER_LOG_DIR, exist_ok=True)
+ORDER_ID_RE = re.compile(r"^[A-Za-z0-9-]{6,64}$")
+MAX_SKEW_SECONDS = 120
+PAYPAL_TIMEOUT = (5, 20)
+PRICE_MAP = {Decimal(str(k)).quantize(Decimal("0.01")): int(v)
+             for k, v in AMOUNT_TO_POINTS.items()}
 
-def log_order(content):
+
+def connect_db():
+    return mysql.connector.connect(**DB_CONFIG)
+
+
+def create_schema():
+    """Only creates missing tables; never silently modifies an existing ledger."""
+    conn = connect_db()
     try:
-        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        with open(f'{ORDER_LOG_DIR}/order_{ts}.log', 'w') as f:
-            f.write(content)
-    except Exception as e:
-        print(f"[log_order ERROR] {e}")
-
-def is_valid_email(email):
-    return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email) is not None
-
-def verify_token():
-    token   = request.headers.get('X-Auth-Token', '')
-    expected= sha256(SHARED_SECRET.encode()).hexdigest()
-    if token != expected:
-        abort(403)
-
-# Ensure all database tables exist ( with file locking to prevent multiple workers )
-def ensure_all_tables():
-    """Create all required tables if they don't exist. Uses file locking to ensure only one worker creates tables."""
-    lock_file_path = os.path.join(ORDER_LOG_DIR, '.table_creation.lock')
-    lock_file = None
-    
-    try:
-        # Create lock file if it doesn't exist
-        os.makedirs(ORDER_LOG_DIR, exist_ok=True)
-        lock_file = open(lock_file_path, 'w')
-        
-        # Try to acquire exclusive lock (non-blocking)
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except IOError:
-            # Another worker is creating tables, wait a bit and check if tables exist
-            time.sleep(0.5)
-            return
-        
-        # We have the lock - create tables
-        conn = None
-        query_executor = None
-        try:
-            conn = mysql.connector.connect(**DB_CONFIG)
-            query_executor = conn.cursor()
-            
-            # Create coin_purchase_agreement_log table
-            query_executor.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS coin_purchase_agreement_log (
-                id             INT AUTO_INCREMENT PRIMARY KEY,
-                user_id        INT          NOT NULL,
-                accepted_at    DATETIME     NOT NULL,
-                ip_address     VARCHAR(45)  NOT NULL,
-                user_agent     VARCHAR(255) NOT NULL,
-                order_id       VARCHAR(255) NULL,
-                payer_email    VARCHAR(255) NULL,
-                INDEX (user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-            
-            # Create myaac_paypal table if not exists
-            query_executor.execute("""
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              user_id INT NOT NULL,
+              accepted_at DATETIME NOT NULL,
+              ip_address VARCHAR(45) NOT NULL,
+              user_agent VARCHAR(255) NOT NULL,
+              order_id VARCHAR(255) NULL,
+              payer_email VARCHAR(255) NULL,
+              INDEX (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS myaac_paypal (
-                id             INT AUTO_INCREMENT PRIMARY KEY,
-                txn_id         VARCHAR(255) NOT NULL,
-                email          VARCHAR(255) NOT NULL,
-                account_id     INT          NOT NULL,
-                price          DECIMAL(10,2) NOT NULL,
-                currency       VARCHAR(10)  NOT NULL,
-                points         INT         NOT NULL,
-                payer_status   VARCHAR(50)  DEFAULT 'verified',
-                payment_status VARCHAR(50)  DEFAULT 'Completed',
-                created        DATETIME     NOT NULL,
-                UNIQUE KEY uq_txn_id (txn_id),
-                INDEX (account_id),
-                INDEX (created)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-                
-            conn.commit()
-            print("[DDL] Tables created/verified successfully")
-            
-        except mysql.connector.Error as err:
-            # Error 1050 = table already exists ( from CREATE TABLE IF NOT EXISTS )
-            # Error 1061 = duplicate key name ( from UNIQUE KEY )
-            if err.errno not in (1050, 1061):
-                print(f"[DDL ERROR] {err}")
-        except Exception as e:
-            print(f"[DDL ERROR] {e}")
-        finally:
-            try:
-                if query_executor:
-                    query_executor.close()
-            except:
-                pass
-            try:
-                if conn and conn.is_connected():
-                    conn.close()
-            except:
-                pass
-                
-    except Exception as e:
-        print(f"[DDL LOCK ERROR] {e}")
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              txn_id VARCHAR(255) NOT NULL,
+              email VARCHAR(255) NOT NULL,
+              account_id INT NOT NULL,
+              price DECIMAL(10,2) NOT NULL,
+              currency VARCHAR(10) NOT NULL,
+              points INT NOT NULL,
+              payer_status VARCHAR(50) DEFAULT 'verified',
+              payment_status VARCHAR(50) DEFAULT 'Completed',
+              created DATETIME NOT NULL,
+              UNIQUE KEY uq_txn_id (txn_id),
+              INDEX (account_id), INDEX (created)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS paypal_pending_orders (
+              order_id VARCHAR(64) PRIMARY KEY,
+              account_id INT NOT NULL,
+              agreement_id INT NOT NULL,
+              amount DECIMAL(10,2) NOT NULL,
+              currency CHAR(3) NOT NULL,
+              points INT NOT NULL,
+              created DATETIME NOT NULL,
+              INDEX (account_id), INDEX (created)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
     finally:
-        if lock_file:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                lock_file.close()
-            except:
-                pass
+        conn.close()
 
-# Ensure database tables exist on app startup ( runs with gunicorn too ) / New
-# Only one worker will actually create tables due to file locking
-ensure_all_tables()
 
-@app.route('/api/paypal/config')
-def get_paypal_config():
+def assert_unique_capture_index(cur):
+    """An existing table created without uq_txn_id is NOT fixed by CREATE TABLE."""
+    cur.execute("""
+        SELECT INDEX_NAME
+        FROM information_schema.statistics
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='myaac_paypal'
+              AND NON_UNIQUE=0
+        GROUP BY INDEX_NAME
+        HAVING COUNT(*)=1 AND MAX(COLUMN_NAME)='txn_id'
+    """)
+    if not cur.fetchone():
+        raise RuntimeError(
+            "Missing UNIQUE index on myaac_paypal(txn_id). "
+            "Review existing duplicates and add the index before enabling checkout."
+        )
+
+
+def verify_internal_request(action):
+    """Authenticate calls from the MyAAC PHP server, never the browser."""
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        abort(403)
+    timestamp = request.headers.get("X-Paypal-Timestamp", "")
+    signature = request.headers.get("X-Paypal-Signature", "")
+    try:
+        when = int(timestamp)
+    except (TypeError, ValueError):
+        abort(403)
+    if abs(int(datetime.now(timezone.utc).timestamp()) - when) > MAX_SKEW_SECONDS:
+        abort(403)
+    raw = request.get_data(cache=True)
+    expected = hmac.new(
+        PAYPAL_INTERNAL_SECRET.encode("utf-8"),
+        timestamp.encode("ascii") + b"." + action.encode("ascii") + b"." + raw,
+        sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        abort(403)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400)
+    account_id = data.get("account_id")
+    if type(account_id) is not int or account_id <= 0:
+        abort(400)
+    return data, account_id
+
+
+def paypal_base():
+    return "https://api-m.sandbox.paypal.com" if PAYPAL["sandbox"] else "https://api-m.paypal.com"
+
+
+def paypal_token():
+    resp = requests.post(
+        paypal_base() + "/v1/oauth2/token",
+        auth=(PAYPAL_UI["client_id"], PAYPAL_UI["secret"]),
+        data={"grant_type": "client_credentials"},
+        timeout=PAYPAL_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def paypal_request(method, path, token, *, data=None, idempotency=None):
+    headers = {"Authorization": "Bearer " + token,
+               "Content-Type": "application/json",
+               "Accept": "application/json"}
+    if idempotency:
+        headers["PayPal-Request-Id"] = idempotency
+    resp = requests.request(
+        method, paypal_base() + path, headers=headers, json=data,
+        timeout=PAYPAL_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def response_error(message, status):
+    return jsonify({"success": False, "error": message}), status
+
+
+def verified_payee(purchase_unit, capture):
+    """Fail closed if PayPal does not identify our configured merchant."""
+    expected_id = PAYPAL.get("merchant_id", "").strip()
+    expected_email = PAYPAL.get("receiver_email", "").strip().casefold()
+    for obj in (capture, purchase_unit):
+        payee = obj.get("payee") or {}
+        if expected_id and payee.get("merchant_id") == expected_id:
+            return True
+        if expected_email and payee.get("email_address", "").casefold() == expected_email:
+            return True
+    return False
+
+
+def validate_order_before_capture(order, account_id, expected_price, expected_currency):
+    """Verify beneficiary, owner and amount *before* moving the buyer's funds."""
+    units = order.get("purchase_units") or []
+    if len(units) != 1:
+        raise ValueError("Unexpected PayPal purchase units")
+    unit = units[0]
+    if unit.get("custom_id") != str(account_id):
+        raise ValueError("PayPal account binding mismatch")
+    amount = unit.get("amount") or {}
+    try:
+        total = Decimal(str(amount["value"])).quantize(Decimal("0.01"))
+    except (KeyError, InvalidOperation, TypeError):
+        raise ValueError("Invalid PayPal order amount")
+    if total != expected_price or amount.get("currency_code") != expected_currency:
+        raise ValueError("PayPal order amount/currency mismatch")
+    if not verified_payee(unit, {}):
+        raise ValueError("PayPal recipient not validated")
+    if order.get("status") not in ("CREATED", "APPROVED", "COMPLETED"):
+        raise ValueError("PayPal order not eligible for capture")
+
+
+def validate_capture(order, account_id, expected_price, expected_currency):
+    if order.get("status") != "COMPLETED":
+        raise ValueError("PayPal order is not completed")
+    units = order.get("purchase_units") or []
+    if len(units) != 1:
+        raise ValueError("Unexpected PayPal purchase units")
+    unit = units[0]
+    if unit.get("custom_id") != str(account_id):
+        raise ValueError("PayPal account binding mismatch")
+    captures = (unit.get("payments") or {}).get("captures") or []
+    if len(captures) != 1 or captures[0].get("status") != "COMPLETED":
+        raise ValueError("Capture is not completed")
+    capture = captures[0]
+    amount = capture.get("amount") or {}
+    unit_amount = unit.get("amount") or {}
+    try:
+        captured = Decimal(str(amount["value"])).quantize(Decimal("0.01"))
+        ordered = Decimal(str(unit_amount["value"])).quantize(Decimal("0.01"))
+    except (KeyError, InvalidOperation, TypeError):
+        raise ValueError("Invalid amount from PayPal")
+    if not (
+        captured == ordered == expected_price
+        and amount.get("currency_code") == expected_currency
+        and unit_amount.get("currency_code") == expected_currency
+    ):
+        raise ValueError("PayPal amount/currency mismatch")
+    if not verified_payee(unit, capture):
+        raise ValueError("PayPal merchant identity mismatch")
+    txn_id = capture.get("id", "")
+    if not txn_id or len(txn_id) > 255:
+        raise ValueError("Missing PayPal capture transaction ID")
+    return txn_id
+
+
+@app.get("/api/paypal/config")
+def public_config():
     return jsonify({
-        'client_id': PAYPAL_UI['client_id'],
-        'currency':  PAYPAL_UI['currency'],
-        'sandbox':   PAYPAL.get('sandbox', True),
-        'images':    COIN_IMAGES
+        "client_id": PAYPAL_UI["client_id"],
+        "currency": PAYPAL_UI["currency"],
+        "sandbox": PAYPAL["sandbox"],
+        "images": COIN_IMAGES,
     })
 
-# Agreement endpoint
-@app.route('/api/agreement', methods=['POST'])
-def log_agreement():
-    # 1) Verify token header
-    token    = request.headers.get('X-Auth-Token')
-    expected = sha256(SHARED_SECRET.encode()).hexdigest()
-    if token != expected:
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
-    # 2) Extract and validate username ( Updated for security means )
-    data = request.get_json(force=True)
-    username = data.get('username', '').strip()
-    if not username or not re.match(r'^[A-Za-z0-9_-]+$', username):
-        return jsonify({'success': False, 'error': 'Invalid username'}), 400
+@app.get("/api/paypal/prices")
+def public_prices():
+    return jsonify({format(k, ".2f"): v for k, v in PRICE_MAP.items()})
 
-    # 3) Gather metadata — use ProxyFix so remote_addr is the real client IP
-    ip_address  = request.remote_addr or 'unknown'
-    user_agent  = request.headers.get('User-Agent', 'unknown')
-    accepted_at = datetime.utcnow()
 
-    # 4) Log to DB
-    conn = None
-    query_executor = None
+@app.post("/internal/agreement")
+def agreement():
+    data, account_id = verify_internal_request("agreement")
+    ip = str(data.get("ip_address") or "unknown")[:45]
+    agent = str(data.get("user_agent") or "unknown")[:255]
+    conn = connect_db()
     try:
-        conn   = mysql.connector.connect(**DB_CONFIG)
-        query_executor = conn.cursor()
-        query_executor.execute("SELECT id FROM accounts WHERE name = %s", (username,))
-        row = query_executor.fetchone()
-        if not row:
-            return jsonify({'success': False, 'error': 'User not found'}), 404
-
-        account_id = row[0]
-        query_executor.execute("""
-          INSERT INTO coin_purchase_agreement_log
-            (user_id, accepted_at, ip_address, user_agent)
-          VALUES (%s, %s, %s, %s)
-        """, (account_id, accepted_at, ip_address, user_agent))
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM accounts WHERE id=%s", (account_id,))
+        if not cur.fetchone():
+            return response_error("Account not found", 404)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cur.execute("""
+            INSERT INTO coin_purchase_agreement_log
+            (user_id, accepted_at, ip_address, user_agent) VALUES (%s,%s,%s,%s)
+        """, (account_id, now, ip, agent))
+        agreement_id = cur.lastrowid
         conn.commit()
-        agreement_id = query_executor.lastrowid
-
-        # Now returns date:time:hour
-        return jsonify({
-            'success':      True,
-            'agreement_id': agreement_id,
-            'accepted_at':  accepted_at.replace(microsecond=0).isoformat()  # e.g. "2025-07-03T19:12:45"
-        })
-
-    except Exception as e:
-        try:
-            if conn:
-                conn.rollback()
-        except:
-            pass
-        # Log the actual error for debugging
-        log_order(f"AGREEMENT ERROR: {str(e)}\n{traceback.format_exc()}\n")
-        return jsonify({'success': False, 'error': 'Database error'}), 500
-
+        return jsonify({"success": True, "agreement_id": agreement_id,
+                        "accepted_at": now.isoformat()})
+    except mysql.connector.Error:
+        conn.rollback()
+        log.exception("Agreement database failure")
+        return response_error("Agreement unavailable", 503)
     finally:
-        try:
-            if query_executor:
-                query_executor.close()
-        except:
-            pass
-        try:
-            if conn and conn.is_connected():
-                conn.close()
-        except:
-            pass
+        conn.close()
 
-@app.route('/api/paypal/prices')
-def get_paypal_prices():
-    return jsonify(AMOUNT_TO_POINTS)
 
-@app.route('/paypal-complete', methods=['POST'])
-def paypal_complete():
-    # 1) debug dump
+@app.post("/internal/orders/create")
+def create_order():
+    data, account_id = verify_internal_request("create")
     try:
-        with open(f'{ORDER_LOG_DIR}/debug_{datetime.utcnow():%Y%m%d_%H%M%S}.log', 'w') as f:
-            f.write("Headers:\n" + repr(request.headers) + "\n")
-            f.write("Body:\n" + request.get_data(as_text=True))
-    except:
-        pass
+        price = Decimal(str(data["price"])).quantize(Decimal("0.01"))
+        agreement_id = int(data["agreement_id"])
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        return response_error("Invalid purchase details", 400)
+    if price not in PRICE_MAP or agreement_id <= 0:
+        return response_error("Unknown package or agreement", 400)
 
-    # 2) auth & parse
-    verify_token()
-    raw = request.get_json(force=True)
-    log_order(f"RAW REQUEST: {raw}\n")
-
-    order_id     = raw.get('orderID', '').strip()
-    username     = raw.get('username', '').strip()
-    payer_email  = raw.get('payer_email', 'unknown@paypal.com').strip()
-    agreement_id = raw.get('agreement_id')
-    if not (order_id and username and agreement_id):
-        return jsonify({'error': 'Missing orderID, username, or agreement_id'}), 400
-    if not re.match(r'^[A-Za-z0-9_-]+$', username):
-        return jsonify({'error': 'Invalid username format'}), 400
-
-    # 3) fetch PayPal order
-    base = 'https://api-m.sandbox.paypal.com' if PAYPAL.get('sandbox',True) else 'https://api-m.paypal.com'
-    auth = (PAYPAL_UI['client_id'], PAYPAL_UI['secret'])
-    tkn = requests.post(f"{base}/v1/oauth2/token", auth=auth, data={'grant_type':'client_credentials'})
-    if tkn.status_code!=200:
-        log_order(f"AUTH ERROR: {tkn.text}\n")
-        return jsonify({'error':'PayPal auth failed'}), 500
-    access_token = tkn.json()['access_token']
-
-    ord_res = requests.get(
-        f"{base}/v2/checkout/orders/{order_id}",
-        headers={'Authorization':f'Bearer {access_token}'}
-    )
-    if ord_res.status_code!=200:
-        log_order(f"ORDER FETCH ERROR: {ord_res.text}\n")
-        return jsonify({'error':'Failed to fetch order'}), 400
-    order = ord_res.json()
-
-    # 4) basic PayPal sanity checks
-    if order.get('status') not in ('COMPLETED','CAPTURED'):
-        log_order(f"ORDER NOT COMPLETED: {order}\n")
-        return jsonify({'error':'Order not completed'}), 400
-
-    pu = order['purchase_units'][0]
-
-    # 4a) custom_id → user binding
-    if pu.get('custom_id') != username:
-        log_order(f"USER MISMATCH: expected {username}, got {pu.get('custom_id')}\n")
-        return jsonify({'error':'User mismatch'}), 403
-
-    # 4b) currency enforcement
-    if pu['amount']['currency_code'] != PAYPAL_UI['currency']:
-        log_order(f"BAD CURRENCY: {pu['amount']}\n")
-        return jsonify({'error':'Invalid currency'}), 400
-
-    # 4c) drill into capture
-    caps = pu.get('payments',{}).get('captures',[])
-    if not caps or caps[0].get('status')!='COMPLETED':
-        log_order(f"CAPTURE MISSING/FAILED: {order}\n")
-        return jsonify({'error':'Capture not completed'}), 400
-
-    txn_id     = caps[0]['id']
-    paid_value = float(caps[0]['amount']['value'])
-    points     = AMOUNT_TO_POINTS.get(paid_value)
-    if points is None:
-        log_order(f"BAD AMOUNT {paid_value}: {order}\n")
-        return jsonify({'error':'Invalid amount'}), 400
-
-    # 5) open DB and process transaction atomically with row-level locking
+    conn = connect_db()
     try:
-        conn   = mysql.connector.connect(**DB_CONFIG)
-        # Set transaction isolation before starting transaction
-        conn.autocommit = False
-        query_executor = conn.cursor()
-        query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM coin_purchase_agreement_log WHERE id=%s AND user_id=%s",
+            (agreement_id, account_id),
+        )
+        if not cur.fetchone():
+            return response_error("Agreement not valid for this account", 403)
+        token = paypal_token()
+        amount = format(price, ".2f")
+        order = paypal_request(
+            "POST", "/v2/checkout/orders", token,
+            data={
+                "intent": "CAPTURE",
+                "purchase_units": [{
+                    "reference_id": str(account_id),
+                    "custom_id": str(account_id),
+                    "amount": {"currency_code": PAYPAL_UI["currency"], "value": amount},
+                }],
+            },
+            idempotency=str(uuid.uuid4()),
+        )
+        order_id = order.get("id", "")
+        if not ORDER_ID_RE.fullmatch(order_id):
+            raise ValueError("PayPal returned an invalid order ID")
+        cur.execute("""
+            INSERT INTO paypal_pending_orders
+              (order_id,account_id,agreement_id,amount,currency,points,created)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (order_id, account_id, agreement_id, amount,
+              PAYPAL_UI["currency"], PRICE_MAP[price],
+              datetime.now(timezone.utc).replace(tzinfo=None)))
+        conn.commit()
+        return jsonify({"success": True, "id": order_id})
+    except (requests.RequestException, ValueError, KeyError, mysql.connector.Error):
+        conn.rollback()
+        log.exception("Order creation failure")
+        return response_error("Unable to create PayPal order", 502)
+    finally:
+        conn.close()
+
+
+@app.post("/internal/orders/capture")
+def capture_order():
+    data, account_id = verify_internal_request("capture")
+    order_id = str(data.get("orderID") or "")
+    if not ORDER_ID_RE.fullmatch(order_id):
+        return response_error("Invalid order ID", 400)
+
+    conn = connect_db()
+    try:
         conn.start_transaction()
-
-        # 6) Get account ID first
-        query_executor.execute("SELECT id FROM accounts WHERE name=%s", (username,))
-        row = query_executor.fetchone()
+        cur = conn.cursor()
+        assert_unique_capture_index(cur)
+        cur.execute("""
+            SELECT amount, currency, points FROM paypal_pending_orders
+            WHERE order_id=%s AND account_id=%s FOR UPDATE
+        """, (order_id, account_id))
+        row = cur.fetchone()
         if not row:
             conn.rollback()
-            return jsonify({'error':'User not found'}), 404
-        account_id = row[0]
+            return response_error("Order does not belong to this account", 403)
+        expected_amount = Decimal(str(row[0])).quantize(Decimal("0.01"))
+        expected_currency, points = row[1], int(row[2])
 
-        # 7) Check if transaction already exists (with lock to prevent race condition)
-        query_executor.execute("SELECT id FROM myaac_paypal WHERE txn_id=%s FOR UPDATE", (txn_id,))
-        existing = query_executor.fetchone()
-        if existing:
+        # Read first to recover safely after capture succeeded but local DB commit failed.
+        token = paypal_token()
+        order = paypal_request("GET", "/v2/checkout/orders/" + order_id, token)
+        if order.get("status") != "COMPLETED":
+            validate_order_before_capture(order, account_id, expected_amount, expected_currency)
+            order = paypal_request(
+                "POST", "/v2/checkout/orders/" + order_id + "/capture", token,
+                data={},
+                idempotency=str(uuid.uuid5(uuid.NAMESPACE_URL, "paypal-capture:" + order_id)),
+            )
+            # PayPal's capture response can omit fields; fetch the authoritative order.
+            order = paypal_request("GET", "/v2/checkout/orders/" + order_id, token)
+
+        txn_id = validate_capture(order, account_id, expected_amount, expected_currency)
+        cur.execute("SELECT account_id FROM myaac_paypal WHERE txn_id=%s", (txn_id,))
+        previous = cur.fetchone()
+        if previous:
             conn.rollback()
-            log_order(f"DUPLICATE TXN: {txn_id} - Already processed\n")
-            return jsonify({'success': True, 'message':'Already processed'}), 200
+            if int(previous[0]) != account_id:
+                return response_error("Capture already belongs to another account", 409)
+            return jsonify({"success": True, "already_processed": True, "points": points})
 
-        # 8) Insert transaction record first (atomic operation)
-        query_executor.execute("""
+        payer_email = str(((order.get("payer") or {}).get("email_address")) or "unknown@paypal.com")[:255]
+        cur.execute("""
             INSERT INTO myaac_paypal
               (txn_id,email,account_id,price,currency,points,payer_status,payment_status,created)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            txn_id, payer_email, account_id, paid_value,
-            PAYPAL_UI['currency'], points,
-            'verified','Completed', datetime.utcnow()
-        ))
-        
-        # 9) Add currency to account based on config.py Currency setting
-        if Currency.lower() == "points":
-            # Add premium points
-            query_executor.execute(
-                "UPDATE accounts SET premium_points = premium_points + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "points"
-        else:
-            # Add coins_transferable (default to coins if not "points")
-            query_executor.execute(
-                "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "coins"
-        
+        """, (txn_id, payer_email, account_id, expected_amount, expected_currency,
+              points, "verified", "Completed", datetime.now(timezone.utc).replace(tzinfo=None)))
+        column = "premium_points" if Currency == "points" else "coins_transferable"
+        cur.execute(
+            "UPDATE accounts SET " + column + " = " + column + " + %s WHERE id=%s",
+            (points, account_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Target account missing during capture")
         conn.commit()
-        return jsonify({'success':True, 'points':points, 'currency': currency_name, 'message':f'{points} {currency_name} added to account.'}), 200
-
-    except mysql.connector.IntegrityError as e:
-        # Duplicate key error (1062) - transaction already processed (fallback)
-        try:
-            conn.rollback()
-        except:
-            pass
-        log_order(f"DUPLICATE TXN: {txn_id} - Already processed (IntegrityError)\n")
-        return jsonify({'success': True, 'message':'Already processed'}), 200
-
-    except Exception as e:
-        log_order(f"DB ERROR: {e}\n")
-        try:
-            conn.rollback()
-        except:
-            pass
-        return jsonify({'error':str(e)}), 500
-
+        return jsonify({"success": True, "points": points, "currency": Currency})
+    except (requests.RequestException, ValueError, KeyError, mysql.connector.Error, RuntimeError):
+        conn.rollback()
+        log.exception("Capture processing failed for order %s", order_id)
+        return response_error(
+            "Payment processing needs attention. Do not pay again; retry this order or contact support.",
+            503,
+        )
     finally:
-        try: 
-            query_executor.close()
-            conn.close()
-        except: 
-            pass
+        conn.close()
 
-@app.route('/paypal-ipn', methods=['POST'])
-def paypal_ipn():
-    ipn_data = request.form.to_dict()
-    verify_payload = {'cmd': '_notify-validate'}
-    verify_payload.update(ipn_data)
 
-    paypal_url = PAYPAL['sandbox_url'] if PAYPAL['sandbox'] else PAYPAL['live_url']
-    verify_response = requests.post(paypal_url, data=verify_payload)
+@app.post("/paypal-complete")
+def disabled_legacy_complete():
+    return response_error("Legacy checkout disabled; update coins.php", 410)
 
-    log_data = f"IPN RECEIVED:\n{ipn_data}\nVerification: {verify_response.text}\n"
 
-    if verify_response.text != 'VERIFIED':
-        log_order(log_data + "ERROR: IPN not verified.\n")
-        return "Invalid IPN", 400
+@app.post("/api/agreement")
+def disabled_legacy_agreement():
+    return response_error("Legacy agreement endpoint disabled; update coins.php", 410)
 
-    txn_id = ipn_data.get('txn_id')
-    payment_status = ipn_data.get('payment_status')
-    payer_status = ipn_data.get('payer_status', '')
-    receiver_email = ipn_data.get('receiver_email')
-    custom_username = ipn_data.get('custom', '').strip()
-    try:
-        mc_gross = float(ipn_data.get('mc_gross', '0.00'))
-    except ValueError:
-        return "Invalid amount", 400
-    currency = ipn_data.get('mc_currency', PAYPAL_UI['currency'])
 
-    if not txn_id or not is_valid_email(receiver_email) or not custom_username:
-        log_order(log_data + "ERROR: Missing fields.\n")
-        return "Invalid data", 400
-    if not re.match(r'^[A-Za-z0-9_-]+$', custom_username):
-        log_order(log_data + f"ERROR: Invalid username format: {custom_username}\n")
-        return "Invalid username format", 400
+@app.post("/paypal-ipn")
+def disabled_legacy_ipn():
+    # The old IPN integration cannot securely bind a payment to an order.
+    # Do not re-enable without a dedicated, verified migration.
+    return response_error("Legacy IPN crediting disabled", 410)
 
-    if payment_status != "Completed" or receiver_email != PAYPAL['receiver_email']:
-        log_order(log_data + "ERROR: Unauthorized or incomplete.\n")
-        return "Unauthorized", 403
 
-    points = next((v for k, v in AMOUNT_TO_POINTS.items() if abs(k - mc_gross) < 0.01), None)
-    if not points:
-        log_order(log_data + f"ERROR: Unknown amount: {mc_gross}\n")
-        return "Unknown amount", 400
-
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        # Set transaction isolation before starting transaction
-        conn.autocommit = False
-        query_executor = conn.cursor()
-        query_executor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        conn.start_transaction()
-
-        query_executor.execute("SELECT id FROM accounts WHERE name = %s", (custom_username,))
-        result = query_executor.fetchone()
-        if not result:
-            conn.rollback()
-            log_order(log_data + f"ERROR: User '{custom_username}' not found.\n")
-            return "User not found", 404
-
-        account_id = result[0]
-
-        # Check if transaction already exists (with lock to prevent race condition)
-        query_executor.execute("SELECT id FROM myaac_paypal WHERE txn_id=%s FOR UPDATE", (txn_id,))
-        existing = query_executor.fetchone()
-        if existing:
-            conn.rollback()
-            log_order(log_data + f"DUPLICATE TXN: {txn_id} - Already processed\n")
-            return "OK", 200
-
-        # Insert transaction record first (atomic operation)
-        query_executor.execute("""
-            INSERT INTO myaac_paypal (txn_id, email, account_id, price, currency, points, payer_status, payment_status, created)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            txn_id, receiver_email, account_id, mc_gross, currency, points, payer_status, payment_status, datetime.utcnow()
-        ))
-        
-        # Add currency to account based on config.py Currency setting
-        if Currency.lower() == "points":
-            # Add premium points
-            query_executor.execute(
-                "UPDATE accounts SET premium_points = premium_points + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "points"
-        else:
-            # Add coins_transferable (default to coins if not "points")
-            query_executor.execute(
-                "UPDATE accounts SET coins_transferable = coins_transferable + %s WHERE id = %s",
-                (points, account_id)
-            )
-            currency_name = "coins"
-        
-        conn.commit()
-        log_order(log_data + f"SUCCESS: {points} {currency_name} added to '{custom_username}'.\n")
-        return "OK", 200
-
-    except mysql.connector.IntegrityError as e:
-        # Duplicate key error (1062) - transaction already processed (fallback)
-        try:
-            conn.rollback()
-        except:
-            pass
-        log_order(log_data + f"DUPLICATE TXN: {txn_id} - Already processed (IntegrityError)\n")
-        return "OK", 200
-
-    except Exception as e:
-        log_order(log_data + f"ERROR: {e}\n")
-        try:
-            conn.rollback()
-        except:
-            pass
-        return "Server error", 500
-
-    finally:
-        try:
-            if conn.is_connected():
-                query_executor.close()
-                conn.close()
-        except:
-            pass
-
-if __name__ == '__main__':
-    # ensure the table is created before we start
-    ensure_all_tables()
-    app.run(host='127.0.0.1', port=FLASK_PORT)
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=FLASK_PORT, debug=False)

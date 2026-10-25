@@ -1,105 +1,48 @@
-# myacc_paypal_api
-Paypal API written with Python for MyAcc ( Live + Sandbox )
+# MyAAC PayPal Checkout — Security Hardening
 
-Latest Update:
-```
-• Click-through agreement modal – users now accept TOS once, timestamped & displayed on the page
-• Package picker redesigned as icon buttons for faster selection
-• PayPal buttons auto-render on load & selection—no manual swaps
+**BREAKING MIGRATION. DO NOT DEPLOY DIRECTLY TO PRODUCTION.**
 
-Security Improvements:
-• Verify custom_id → prevents order spoofing
-• Enforce unique PayPal transactions (idempotent processing)
-• Validate currency on every order
-• Stronger X-Auth-Token (SHA-256 hashed secret)
-• Short-lived PayPal OAuth tokens per request
+The new flow authenticates the customer with a MyAAC PHP session and CSRF token,
+uses a short-lived HMAC to call Flask from PHP over loopback, and creates/captures
+Orders v2 server-side. Every order is bound to an immutable account ID, agreement,
+fixed server-side amount, currency and the intended PayPal merchant. Account credits
+require a verified PayPal capture and a unique transaction ID in MySQL.
 
-Fixes & Tweaks:
-• Debug logging of all order requests & responses
-• Proper capture-amount lookup for v2 orders
-• Safe DB schema migrations at startup (agreement log & unique txn index)
+## Mandatory migration checklist
 
-# 2025-11-07
--Added option to select points or coins as coins_transferable
--Fixed an issue where error 500 occured on new setups with agreement
--Added an option to add a route on new myacc version to simply use coins and history at the menu
--changed the way workers handles the orders to make sure it only handles once instead of accidental multiple ( Has not occured yet but to make sure )
-```
+1. Back up the live MyAAC database and current PHP, Python and Nginx files.
+2. Copy .env.example to a PRIVATE server-only .env (outside public web access);
+   generate independent random SECRET_KEY and PAYPAL_INTERNAL_SECRET values
+   (at least 32 characters each). Python and PHP must use the same HMAC secret.
+   Rotate any formerly exposed live secrets.
+3. Configure DB credentials, PayPal client ID/secret, merchant ID (preferred) or
+   receiver email, currency and correct points/coins field. Use PAYPAL_SANDBOX=true
+   for initial tests.
+4. Apply migrations/001_checkout_tables.sql to the verified database. Confirm
+   myaac_paypal(txn_id) has a single-column UNIQUE index; CREATE TABLE IF NOT
+   EXISTS never upgrades an existing ledger. Resolve duplicates before adding.
+5. Install dependencies (pip install -r requirements.txt) and PHP cURL.
+   Deploy app.py, config.py, coins.php and Nginx locations AS ONE CHANGE.
+   Never expose /internal/* publicly; Gunicorn binds to 127.0.0.1:5000.
+6. Confirm this MyAAC version uses PHP sessions and routes authenticated POST
+   /index.php?subtopic=coins&paypal_action=... requests to coins.php.
+7. Offline checks: python -m py_compile app.py config.py;
+   python -m unittest discover -s tests -v;
+   php -l system/pages/coins.php; nginx -t after incorporating Nginx changes.
+8. Sandbox acceptance tests: each package, duplicate capture, different account,
+   wrong currency/amount/merchant, invalid agreement, failed PayPal API requests,
+   DB outage after capture with safe retry, missing unique index, concurrent calls.
+9. Deploy LIVE only after all tests pass and a rollback/reconciliation plan exists.
 
-## 🔧 Setup Instructions
+Run Gunicorn: gunicorn --workers 3 --bind 127.0.0.1:5000 app:app
 
-### 1. Install Dependencies
-```bash
-sudo apt update
-sudo apt install -y python3-pip python3-venv nginx
-```
+## Remaining work / limitations
 
-### 2. Assuming your app will live at /var/www/html/paypal:
-```
-sudo mkdir -p /var/www/html/paypal
-cd /var/www/html/paypal
-python3 -m venv venv
-source venv/bin/activate
-```
+Old /paypal-complete, /api/agreement and /paypal-ipn endpoints deliberately return
+410. If IPN is used in production, the migration must first introduce verified
+webhooks and reconciliation; this branch does NOT process IPN. Refunds, disputes and
+chargebacks are not automated. No live PayPal tests were performed.
 
-### 3. Create a requirements.txt file with:
-```
-flask
-requests
-mysql-connector-python
-gunicorn
-```
-
-### 4. Then install:
-```
-pip install -r requirements.txt
-```
-
-### 5. Give correct permissions
-```
-sudo chmod 600 /var/www/html/paypal/.env
-sudo chown www-data:www-data /var/www/html/paypal/.env
-sudo chmod 775 /var/www/html/paypal/.env
-```
-
-### 6. Add rate limiting, required for server block
-```
-# sudo nano /etc/nginx/nginx.conf #nginx.conf path at default position
-http {
-    # … your other http settings …
-
-    # Paypal api
-    client_header_buffer_size 8k;
-    large_client_header_buffers 4 16k;
-    proxy_read_timeout 60;
-    # ─── RATE LIMITING ZONE ─────────────────────────────────
-    # 5 requests per second per IP, 10 MB of state
-    limit_req_zone $binary_remote_addr zone=apilimit:10m rate=5r/s;
-
-    # include your sites-available/*.conf etc.
-}
-```
-
-### Running the server ( Development )
-```
-python app.py
-```
-
-### Running the server ( Production )
-```
-gunicorn --workers 3 --bind 127.0.0.1:5000 app:app
-```
-
-# Webhooks and paypal setup
-```
-Use the default application already provided on your paypal account ( Will require a business account )
-Take the client id and secret id, paste it into the config, swap out your email to the correct one,
-boot the script and sit back, relax
-
-# For Live and Sandbox
-This API does not use any webhooks anymore, so you do not have to edit the application, do the same for live/sandbox,
-Use your paypal email for live, use your sandbox business account for sandbox and pay using a personal sandbox account
-
-You find both at the same spot, at developer paypal,
-Simply press the button up right corner between sandbox and live mode.
-```
+The previously tracked .env was removed from the branch but may still exist in
+Git history. Deleting a file in a new commit does not remove historical secrets.
+Python requirements have bounded version ranges rather than a production lockfile.
