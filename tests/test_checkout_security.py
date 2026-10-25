@@ -61,6 +61,14 @@ class SecurityTests(unittest.TestCase):
  def test_wrong_merchant_rejected(self):
   with self.assertRaises(ValueError):
    checkout.validate_capture(completed(merchant="WRONG"),42,Decimal("5.00"),"EUR")
+ def test_precapture_validation(self):
+  order=completed()
+  order["status"]="APPROVED"
+  checkout.validate_order_before_capture(order,42,Decimal("5.00"),"EUR")
+  order["purchase_units"][0]["payee"]["merchant_id"]="OTHER-MERCHANT"
+  with self.assertRaises(ValueError):
+   checkout.validate_order_before_capture(order,42,Decimal("5.00"),"EUR")
+
  def test_legacy_crediting_disabled(self):
   for path in ("/paypal-complete","/paypal-ipn","/api/agreement"):
    self.assertEqual(self.client.post(path).status_code,410)
