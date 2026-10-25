@@ -25,13 +25,19 @@ DB_CONFIG = {
     "connection_timeout": 5,
 }
 
+def optional_merchant_value(name):
+    value = os.getenv(name, "").strip()
+    if value.lower().startswith(("replace_", "example_", "changeme", "your_")):
+        return ""
+    return value
+
 PAYPAL = {
     "sandbox": os.getenv("PAYPAL_SANDBOX", "true").lower() in ("1", "true", "yes"),
-    "merchant_id": os.getenv("PAYPAL_MERCHANT_ID", "").strip(),
-    "receiver_email": os.getenv("PAYPAL_RECEIVER_EMAIL", "").strip(),
+    "merchant_id": optional_merchant_value("PAYPAL_MERCHANT_ID"),
+    "receiver_email": optional_merchant_value("PAYPAL_RECEIVER_EMAIL"),
 }
 if not PAYPAL["merchant_id"] and not PAYPAL["receiver_email"]:
-    raise RuntimeError("Set PAYPAL_MERCHANT_ID or PAYPAL_RECEIVER_EMAIL")
+    raise RuntimeError("Set a real PAYPAL_MERCHANT_ID or PAYPAL_RECEIVER_EMAIL")
 PAYPAL_UI = {
     "client_id": required("PAYPAL_CLIENT_ID"),
     "secret": required("PAYPAL_CLIENT_SECRET"),
