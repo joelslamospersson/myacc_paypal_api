@@ -1,0 +1,23 @@
+name: Security regression checks
+on:
+  push:
+    branches: [security/payment-hardening-20261025]
+  pull_request:
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile app.py config.py
+      - run: python -m unittest discover -s tests -v
+  php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: php -l system/pages/coins.php
+      - run: php -l system/pages/purchase_history.php
